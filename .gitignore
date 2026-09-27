@@ -1,0 +1,11 @@
+# Python bytecode. `hwdeck` is a script, so running it writes a __pycache__ next to it;
+# a compiled copy of the source is not something a public repo should carry.
+__pycache__/
+*.pyc
+*.pyo
+
+# Local config. config.example.toml is the template; the real one names a machine's own
+# services and is never committed (that is what keeps this repo white-label).
+config.toml
+
+.DS_Store
