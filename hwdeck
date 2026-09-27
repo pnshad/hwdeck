@@ -592,9 +592,11 @@ class Panel:
         self.prev = {}
         self.log = deque(maxlen=8)
         self.vavg = {}                                  # rolling mean per voltage rail
+        self.vtop = {}                                  # first reading per rail, fixes its scale
         self.hist = {k: deque(maxlen=HIST) for k in ("cpu_t", "gpu_t", "gpw", "cpw")}
         self.rapl = None
         self.peaks = Peaks()
+        self.counters = Counters()
 
     def note(self, key, lvl):
         old = self.prev.get(key)
@@ -1153,6 +1155,57 @@ def slider(s, x, y, h, dev, span=0.06):
     c = "G" if abs(dev) < 0.03 else ("Y" if abs(dev) < 0.08 else "R")
     s.put(x - 1, y + pos, "▐█▌", c)
 
+def logf(v, lo=1.0, hi=1e8):
+    """Log scale so a trickle still moves: lo -> 0, hi -> 1."""
+    import math
+    if v <= lo:
+        return 0.0
+    return min(1.0, math.log10(v / lo) / math.log10(hi / lo))
+
+def rail_scale(v):
+    """Full scale for a voltage bar: the next standard rail above it."""
+    for top in (1.5, 2.0, 4.0, 6.0, 14.0):
+        if v < top * 0.92:
+            return top
+    return v * 1.2
+
+class Counters:
+    """Rates from /proc/stat and /proc/net/dev between refreshes."""
+    def __init__(self):
+        self.prev, self.t = None, None
+
+    def sample(self):
+        now = time.time()
+        cur = {}
+        for line in (read("/proc/stat", "") or "").splitlines():
+            f = line.split()
+            if f and f[0] == "cpu":
+                cur["cpu"] = list(map(int, f[1:9]))
+            elif f and f[0] in ("ctxt", "intr"):
+                cur[f[0]] = int(f[1])
+            elif f and f[0] == "procs_running":
+                cur["running"] = int(f[1])
+        for line in (read("/proc/net/dev", "") or "").splitlines()[2:]:
+            name, rest = line.split(":", 1)
+            f = rest.split()
+            cur["net:" + name.strip()] = (int(f[0]), int(f[1]), int(f[8]), int(f[9]))
+        out = {"running": cur.get("running", 0)}
+        if self.prev:
+            dt = max(now - self.t, 1e-3)
+            a, b = self.prev["cpu"], cur["cpu"]
+            tot = max(sum(b) - sum(a), 1)
+            names = ["user", "nice", "system", "idle", "iowait", "irq", "softirq", "steal"]
+            out["cpu"] = {n: (b[i] - a[i]) / tot for i, n in enumerate(names)}
+            out["ctxt"] = (cur["ctxt"] - self.prev["ctxt"]) / dt
+            out["intr"] = (cur["intr"] - self.prev["intr"]) / dt
+            out["net"] = {}
+            for k, v in cur.items():
+                if k.startswith("net:") and k in self.prev:
+                    p = self.prev[k]
+                    out["net"][k[4:]] = tuple((v[i] - p[i]) / dt for i in range(4))
+        self.prev, self.t = cur, now
+        return out
+
 def draw_eq(s, st, cfg, pn):
     w, h = s.w, s.h
     peaks = pn.peaks
@@ -1163,6 +1216,7 @@ def draw_eq(s, st, cfg, pn):
     root = next((d for d in st["disks"] if d[0] == "/"), st["disks"][0] if st["disks"] else None)
     volts, powers, pwms, intr = all_channels(cfg)
     pn.hist["gpw"].append(gpow or 0)
+    k = pn.counters.sample()
 
     # ---- top line: name, clock, services as dots --------------------------------------
     s.put(1, 0, (cfg.get("title") or st["host"]).upper(), ACCENT)
@@ -1208,10 +1262,13 @@ def draw_eq(s, st, cfg, pn):
     x += mw
     _, rx, tx = st["net"]
     eqbox(s, x, y, nw, bh, "net", f"{human(rx)}/s", "C")
-    top = max(max(st["hist"]["rx"], default=0), max(st["hist"]["tx"], default=0), 64 * 1024)
-    half = (bh - 2) // 2
-    history_bars(s, x + 1, y + 1, nw - 2, half, st["hist"]["rx"], 0, top)
-    history_bars(s, x + 1, y + 1 + half, nw - 2, bh - 2 - half, st["hist"]["tx"], 0, top)
+    nets = {n: v for n, v in k.get("net", {}).items() if n != "lo" and not n.startswith(("veth", "docker", "br-"))}
+    nf, nl = [], []
+    for n, (brx, prx, btx, ptx) in sorted(nets.items(), key=lambda kv: -sum(kv[1]))[:4]:
+        nf += [logf(brx, 10, 1e8), logf(btx, 10, 1e8), logf(prx, 1, 1e5), logf(ptx, 1, 1e5)]
+        tag = n[:1].upper()
+        nl += [tag + "R", tag + "T", "pr", "pt"]
+    eqgroup(s, x + 1, y + 1, nw - 2, bh - 2, nf, peaks, "net", labels=nl)
 
     # ---- band 2: temperatures | fans ----------------------------------------------------
     y, bh = y + 17, 15
@@ -1244,26 +1301,36 @@ def draw_eq(s, st, cfg, pn):
     # ---- band 3: load history | power | voltage rails -----------------------------------
     y = y + bh
     bh = h - y
-    vw = 2 + len(volts) * 4 + 1 if volts else 0
-    pw = 32
+    vw = 2 + len(volts) * 3 + 1 if volts else 0
+    pw = 2 + 6 * 4 + 1
     lw = w - vw - pw
-    eqbox(s, 0, y, lw, bh, "load", "cpu ▲  gpu ▼", DIM)
-    halfh = (bh - 2) // 2
-    history_bars(s, 1, y + 1, lw - 2, halfh, st["hist"]["cpu"], 0, 100)
-    history_bars(s, 1, y + 1 + halfh, lw - 2, bh - 2 - halfh, st["hist"]["gpu"], 0, 100)
+    ct = k.get("cpu", {})
+    nc = max(len(cores), 1)
+    lf = [ct.get("user", 0), ct.get("system", 0), ct.get("iowait", 0), ct.get("irq", 0) + ct.get("softirq", 0),
+          ct.get("nice", 0), st["load"][0] / nc, st["load"][1] / nc, st["load"][2] / nc,
+          min(1.0, k.get("running", 0) / nc), logf(k.get("ctxt", 0), 100, 1e6), logf(k.get("intr", 0), 100, 1e6)]
+    eqbox(s, 0, y, lw, bh, "load", f"{st['load'][0]:.2f}", heat(st["load"][0] / nc))
+    eqgroup(s, 1, y + 1, lw - 2, bh - 2, lf, peaks, "load",
+            labels=["us", "sy", "io", "ir", "ni", "l1", "l5", "lf", "rn", "cs", "in"])
     x = lw
+    gv = next((v for grp, name, v in volts if grp == "GPU"), None)
+    fq_all = core_freqs(len(cores))
+    fmax = max((mx for _, mx in fq_all), default=0)
+    favg = sum(c for c, _ in fq_all) / len(fq_all) if fq_all else 0
+    duty = [p[2] for p in pwms if p[3] not in ("0", None)]
+    pf = [(gpow / gcap) if gpow is not None and gcap else 0, ((gv or 0.7) - 0.7) / 0.5,
+          (g.get("sclk") or 0) / (g.get("sclk_max") or 1), (g.get("mclk") or 0) / (g.get("mclk_max") or 1),
+          favg / fmax if fmax else 0, sum(duty) / len(duty) if duty else 0]
     eqbox(s, x, y, pw, bh, "power", f"{gpow or 0:.0f}W" if gpow is not None else "", heat((gpow or 0) / (gcap or 1)))
-    history_bars(s, x + 1, y + 1, pw - 2, bh - 2, pn.hist["gpw"], 0, gcap or 100)
+    eqgroup(s, x + 1, y + 1, pw - 2, bh - 2, pf, peaks, "pow", labels=["GW", "GV", "GC", "GM", "CC", "FD"])
     if vw:
         x += pw
-        eqbox(s, x, y, vw, bh, "rails", f"{len(volts)}", DIM)
-        for i, (grp, name, v) in enumerate(volts):
-            key = f"{grp}{name}"
-            avg = pn.vavg.get(key, v)
-            pn.vavg[key] = avg * 0.95 + v * 0.05
-            dev = (v - avg) / avg if avg else 0
-            slider(s, x + 3 + i * 4, y + 1, bh - 3, dev, 0.30 if name in ("VCORE", "VDDGFX") else 0.06)
-            s.put(x + 2 + i * 4, y + bh - 2, f"{v:.1f}"[:3], DIM)
+        vc = next((v for grp, name, v in volts if name == "VCORE"), None)
+        eqbox(s, x, y, w - x, bh, "rails", f"{vc:.2f}V" if vc else f"{len(volts)}", "W")
+        rf = [v / rail_scale(pn.vtop.setdefault(f"{grp}{name}", v)) for grp, name, v in volts]
+        rl = [{"VCORE": "VC", "VDDGFX": "GV", "AVCC": "AV", "3VCC": "33", "3VSB": "SB", "VBAT": "BT"}.get(name, name[-2:])
+              for grp, name, v in volts]
+        eqgroup(s, x + 1, y + 1, w - x - 2, bh - 2, rf, peaks, "rail", labels=rl)
 
 def main():
     ap = argparse.ArgumentParser(description="one-page hardware dashboard for a terminal or Linux console")
