@@ -1,8 +1,7 @@
 #!/usr/bin/env python3
 """hwdeck - one-page hardware dashboard for a terminal or a bare Linux console.
 
-CPU, GPU, memory, temperatures, fans, disks, network, top processes and services on a
-single screen, with btop-style history graphs. Made for old screens repurposed as wall
+CPU, GPU, memory, temperatures, fans, disk, network and services on a single screen, with btop-style history graphs. Made for old screens repurposed as wall
 monitors (a Linux framebuffer console on an old tablet, a Raspberry Pi display, a spare
 laptop): 16 colours and CP437 glyphs only, so it renders on a plain VT with the default
 kernel font. Pure Python 3 standard library; reads /proc and /sys, no root needed.
@@ -383,33 +382,6 @@ def diskio():
             wr += int(f[9]) * 512
     return rd, wr
 
-class Procs:
-    def __init__(self):
-        self.prev, self.prev_t, self.by_mem = {}, None, []
-        self.hz = os.sysconf("SC_CLK_TCK")
-        self.page = os.sysconf("SC_PAGE_SIZE")
-
-    def sample(self, n):
-        now_t, cur, rows = time.time(), {}, []
-        for pid in os.listdir("/proc"):
-            if not pid.isdigit():
-                continue
-            st = read(f"/proc/{pid}/stat")
-            if not st:
-                continue
-            name = st[st.find("(") + 1: st.rfind(")")]
-            f = st[st.rfind(")") + 2:].split()
-            ticks = int(f[11]) + int(f[12])
-            rss = int(f[21]) * self.page
-            cur[pid] = ticks
-            if self.prev_t and pid in self.prev:
-                cpu = 100.0 * (ticks - self.prev[pid]) / self.hz / (now_t - self.prev_t)
-                rows.append((cpu, rss, pid, name))
-        self.prev, self.prev_t = cur, now_t
-        self.by_mem = sorted(rows, key=lambda r: r[1], reverse=True)[:n]
-        rows.sort(key=lambda r: (r[0], r[1]), reverse=True)
-        return rows[:n], len(cur)
-
 def service_states(cfg):
     res = []
     for u in cfg.get("system", []):
@@ -601,11 +573,11 @@ def main():
     svc_cfg = cfg.get("services", {})
     extra_cmds = cfg.get("extra", {}).get("commands", [])
 
-    cpu, gpu, procs = Cpu(), Gpu(), Procs()
+    cpu, gpu = Cpu(), Gpu()
     hist = {k: deque(maxlen=HIST) for k in ("cpu", "gpu", "mem", "rx", "tx")}
     last_net, last_io, slow_t = None, None, 0
     services, extra = [], []
-    cpu.sample(); procs.sample(0)                         # prime the deltas
+    cpu.sample()                                          # prime the deltas
     if not args.once:
         sys.stdout.write(ESC + "?25l" + ESC + "2J")
     try:
@@ -635,17 +607,16 @@ def main():
                 services = service_states(svc_cfg)
                 extra = [(run("sh", "-c", c, timeout=5).strip().splitlines() or [""])[0] for c in extra_cmds]
                 slow_t = t0
-            top, nproc = procs.sample(12)
             for k, v in (("cpu", total), ("gpu", g.get("busy", 0)), ("mem", mem["used"] / mem["total"] * 100),
                          ("rx", rx), ("tx", tx)):
                 hist[k].append(v)
             w, h = shutil.get_terminal_size((128, 48))
             s = Screen(w, h)
             state = {"hist": hist, "host": socket.gethostname(), "uptime": float((read("/proc/uptime", "0") or "0").split()[0]),
-                     "load": os.getloadavg(), "nproc": nproc, "cpu_model": cpu.model, "gpu_name": gpu.name, "gpu_kind": gpu.kind,
+                     "load": os.getloadavg(), "cpu_model": cpu.model, "gpu_name": gpu.name, "gpu_kind": gpu.kind,
                      "kernel": f"{os.uname().sysname} {os.uname().release}", "cpu": total, "cores": cores,
                      "cpu_freq": freq, "gpu": g, "mem": mem, "temps": temps, "fans": fans, "net": (iface, rx, tx),
-                     "disks": mounts(), "io": io_rate, "procs": top, "procs_mem": procs.by_mem, "services": services, "extra": extra}
+                     "disks": mounts(), "io": io_rate, "services": services, "extra": extra}
             if w < 100 or h < 40:
                 s.put(0, 0, f"hwdeck needs at least 100x40, this terminal is {w}x{h}", "Y")
             else:
