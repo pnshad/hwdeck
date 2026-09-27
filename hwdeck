@@ -1880,7 +1880,7 @@ def main():
     ap.add_argument("--interval", type=float, default=None, help="seconds between refreshes (default 2)")
     ap.add_argument("--once", action="store_true", help="draw one frame and exit (for testing)")
     ap.add_argument("--style", choices=["bunker", "btop", "eq", "panel", "glance"],
-                    help="bunker: heavy chassis of meters (default, needs 128x46); btop: btop-style boxes; eq: equalizer bars; panel: control-room lamps; glance: big numerals. eq/panel need 120x46")
+                    help="btop: btop-like boxes (default); bunker: heavy chassis of meters; eq: equalizer bars; panel: control-room lamps; glance: big numerals. eq/panel need 120x46")
     ap.add_argument("--version", action="version", version=f"hwdeck {VERSION}")
     args = ap.parse_args()
 
@@ -1895,7 +1895,7 @@ def main():
     extra_cmds = cfg.get("extra", {}).get("commands", [])
 
     cpu, gpu = Cpu(), Gpu()
-    style = args.style or cfg.get("style", "bunker")
+    style = args.style or cfg.get("style", "btop")
     pn = Panel()
     hist = {k: deque(maxlen=HIST) for k in ("cpu", "gpu", "gpw", "mem", "rx", "tx")}
     last_net, last_io, slow_t = None, None, 0

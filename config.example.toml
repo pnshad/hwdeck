@@ -1,6 +1,9 @@
 # hwdeck configuration. Copy to ~/.config/hwdeck/config.toml (every key is optional).
 
-# Shown top-left instead of the hostname.
+# Look: btop (default), bunker, eq, panel or glance.
+# style = "btop"
+
+# Shown instead of the hostname.
 # title = "workstation"
 
 # Seconds between refreshes.
