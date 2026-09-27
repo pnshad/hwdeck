@@ -1,0 +1,27 @@
+# hwdeck configuration. Copy to ~/.config/hwdeck/config.toml (every key is optional).
+
+# Shown top-left instead of the hostname.
+# title = "workstation"
+
+# Seconds between refreshes.
+interval = 2
+
+# Network interface for the NET sparklines (default: the busiest one).
+# net_interface = "eth0"
+
+# Regular expressions matched against "GROUP label" to hide temperature sensors,
+# e.g. a sensor your board reports but that is not wired to anything.
+# hide_sensors = ["ACPI", "Board socket"]
+
+# Also show fan headers reading 0 rpm (default: only GPU fans, which stop when idle).
+# show_idle_fans = false
+
+# systemd units shown as coloured squares in the status bar.
+[services]
+system = ["ssh"]
+# user = ["syncthing"]
+
+# Shell commands whose first output line is shown under the status bar (refreshed every 15 s).
+[extra]
+commands = []
+# commands = ['echo "backups: $(ls /srv/backup | wc -l) snapshots"']
