@@ -17,7 +17,7 @@ try:
 except ImportError:                      # Python < 3.11: config file is optional anyway
     tomllib = None
 
-VERSION = "0.3.0"
+VERSION = "0.4.0"
 HIST = 300
 
 # ================================================================= drawing ====
@@ -594,6 +594,7 @@ class Panel:
         self.vavg = {}                                  # rolling mean per voltage rail
         self.hist = {k: deque(maxlen=HIST) for k in ("cpu_t", "gpu_t", "gpw", "cpw")}
         self.rapl = None
+        self.peaks = Peaks()
 
     def note(self, key, lvl):
         old = self.prev.get(key)
@@ -1055,12 +1056,222 @@ def lab_short(label):
             .replace("PCH_CHIP_TEMP", "PCH").replace("PCH_CHIP_CPU_MAX_TEMP", "PCHMX")
             .replace("PCH_CPU_TEMP", "PCHCPU").replace("PCH_MCH_TEMP", "MCH").replace("AUXTIN", "AUX"))
 
+# ============================================================== equalizer ====
+# The default style: groups of spectrum-analyzer bars, like an old media player's
+# visualizer. Segmented bars (one ▄ per cell, so rows show as separate LEDs), a
+# green -> yellow -> red gradient by height, and a white peak-hold cap that waits a
+# moment and then falls. Voltage rails are EQ sliders: a knob on a track, centred on
+# the rail's own running average. Text is kept to box titles and one figure per box.
+
+EQ_COLORS = ((0.40, "g"), (0.60, "G"), (0.75, "Y"), (0.90, "y"), (1.01, "R"))
+
+def eq_color(pos):
+    for limit, c in EQ_COLORS:
+        if pos <= limit:
+            return c
+    return "R"
+
+class Peaks:
+    """Peak hold per bar: stays 3 refreshes, then drops one segment per refresh."""
+    def __init__(self):
+        self.p = {}
+
+    def update(self, key, lit):
+        peak, hold = self.p.get(key, (0, 0))
+        if lit >= peak:
+            peak, hold = lit, 3
+        elif hold > 0:
+            hold -= 1
+        else:
+            peak = max(lit, peak - 1)
+        self.p[key] = (peak, hold)
+        return peak
+
+def eqbar(s, x, y, h, w, frac, peaks=None, key=None, color=None):
+    """One analyzer bar, bottom at y+h-1. Unlit segments are faint so the grid is always visible."""
+    frac = max(0.0, min(1.0, frac))
+    lit = round(frac * h)
+    if frac > 0.01 and lit == 0:
+        lit = 1
+    peak = peaks.update(key, lit) if peaks is not None else 0
+    for r in range(h):
+        yy = y + h - 1 - r
+        if r < lit:
+            s.put(x, yy, "▄" * w, color or eq_color((r + 1) / h))
+        elif peak > lit and r == peak - 1:
+            s.put(x, yy, "▄" * w, "W")                      # peak-hold cap
+        else:
+            s.put(x, yy, " " * w, "k")
+    return lit
+
+def eqbox(s, x, y, w, h, title, figure="", fig_c="W"):
+    s.put(x, y, "┌" + "─" * (w - 2) + "┐", DIM)
+    for i in range(1, h - 1):
+        s.put(x, y + i, "│", DIM)
+        s.put(x + w - 1, y + i, "│", DIM)
+    s.put(x, y + h - 1, "└" + "─" * (w - 2) + "┘", DIM)
+    s.put(x + 2, y, f" {title.upper()} ", ACCENT)
+    if figure:
+        s.put(x + w - 3 - len(figure), y, f" {figure} ", fig_c)
+
+def eqgroup(s, x, y, w, h, fracs, peaks, prefix, colors=None, labels=None):
+    """Bars spread evenly over w cells: bar width 1-3, one-cell gaps."""
+    n = len(fracs)
+    if n == 0:
+        return
+    bw = max(1, min(3, (w + 1) // n - 1))
+    step = bw + 1
+    used = n * step - 1
+    x0 = x + max(0, (w - used) // 2)
+    bh = h - (1 if labels else 0)
+    for i, f in enumerate(fracs):
+        if x0 + i * step + bw > x + w:
+            break
+        eqbar(s, x0 + i * step, y, bh, bw, f, peaks, f"{prefix}{i}", colors[i] if colors else None)
+        if labels and labels[i]:
+            s.put(x0 + i * step, y + bh, labels[i][:bw], DIM)
+
+def history_bars(s, x, y, w, h, data, lo, hi):
+    """Scrolling analyzer: one 1-cell bar per sample, newest on the right."""
+    vals = list(data)[-w:]
+    pad = w - len(vals)
+    for i in range(w):
+        v = vals[i - pad] if i >= pad else lo
+        f = 0.0 if hi <= lo else max(0.0, min(1.0, (v - lo) / (hi - lo)))
+        lit = round(f * h)
+        if f > 0.01 and lit == 0:
+            lit = 1
+        for r in range(h):
+            s.put(x + i, y + h - 1 - r, "▄" if r < lit else " ", eq_color((r + 1) / h) if r < lit else "k")
+
+def slider(s, x, y, h, dev, span=0.06):
+    """EQ slider: a track with a knob, centre = the rail's running average, full scale = ±span."""
+    mid = h // 2
+    pos = mid - round(max(-1.0, min(1.0, dev / span)) * mid)
+    for r in range(h):
+        s.put(x, y + r, "┼" if r == mid else "│", DIM)
+    c = "G" if abs(dev) < 0.03 else ("Y" if abs(dev) < 0.08 else "R")
+    s.put(x - 1, y + pos, "▐█▌", c)
+
+def draw_eq(s, st, cfg, pn):
+    w, h = s.w, s.h
+    peaks = pn.peaks
+    temps_all = [t for t in st["temps"] if not re.match(r"^(PECI|Sensor \d)", t[1]) and t[2] > 0.5]
+    g, m = st["gpu"], st["mem"]
+    cores = st["cores"]
+    gtemp, gpow, gcap = g.get("temp"), g.get("power"), g.get("power_cap") or 0
+    root = next((d for d in st["disks"] if d[0] == "/"), st["disks"][0] if st["disks"] else None)
+    volts, powers, pwms, intr = all_channels(cfg)
+    pn.hist["gpw"].append(gpow or 0)
+
+    # ---- top line: name, clock, services as dots --------------------------------------
+    s.put(1, 0, (cfg.get("title") or st["host"]).upper(), ACCENT)
+    clock = time.strftime("%H:%M:%S")
+    s.put(w - 1 - len(clock), 0, clock, INK2)
+    sx = 2 + len(cfg.get("title") or st["host"]) + 2
+    for u, stt in st["services"]:
+        s.put(sx, 0, "■", "G" if stt == "active" else "R")
+        sx += 2
+    if st["extra"]:
+        e = ascii_only(st["extra"][0]).upper()
+        s.put((w - len(e)) // 2, 0, e, DIM)
+
+    # ---- band 1: CPU cores | GPU | memory ----------------------------------------------
+    y, bh = 1, 17
+    cw = 2 + len(cores) * 3 + 1
+    cw = max(cw, 30)
+    gw = 2 + 7 * 4 + 1
+    mw = 2 + 4 * 4 + 1
+    nw = w - cw - gw - mw
+    eqbox(s, 0, y, cw, bh, "cpu", f"{st['cpu']:.0f}%", heat(st["cpu"] / 100))
+    eqgroup(s, 2, y + 1, cw - 4, bh - 2, [c / 100 for c in cores], peaks, "core",
+            labels=[f"{i:02d}" for i in range(len(cores))])
+    x = cw
+    busy = g.get("busy", 0)
+    eqbox(s, x, y, gw, bh, "gpu", f"{busy:.0f}%", heat(busy / 100))
+    if st.get("gpu_kind"):
+        gf = [busy / 100,
+              (g["vram_used"] / g["vram_total"]) if g.get("vram_total") else 0,
+              (gpow / gcap) if gpow is not None and gcap else 0,
+              ((gtemp - 20) / 90) if gtemp is not None else 0,
+              min(1.0, (g.get("fan") or 0) / 3000) if g.get("fan") is not None else (g.get("fan_pct") or 0) / 100,
+              (g.get("sclk") or 0) / (g.get("sclk_max") or 1),
+              (g.get("mclk") or 0) / (g.get("mclk_max") or 1)]
+        eqgroup(s, x + 2, y + 1, gw - 4, bh - 2, gf, peaks, "gpu",
+                labels=["BS", "VR", "PW", "TM", "FN", "CK", "MK"])
+    x += gw
+    mf = m["used"] / m["total"]
+    eqbox(s, x, y, mw, bh, "mem", f"{m['used'] / 2**30:.1f}G", heat(mf))
+    eqgroup(s, x + 2, y + 1, mw - 4, bh - 2,
+            [mf, m["cached"] / m["total"], (m["swap_used"] / m["swap_total"]) if m["swap_total"] else 0,
+             (root[1] / root[2]) if root else 0], peaks, "mem", labels=["US", "CA", "SW", "DK"])
+    x += mw
+    _, rx, tx = st["net"]
+    eqbox(s, x, y, nw, bh, "net", f"{human(rx)}/s", "C")
+    top = max(max(st["hist"]["rx"], default=0), max(st["hist"]["tx"], default=0), 64 * 1024)
+    half = (bh - 2) // 2
+    history_bars(s, x + 1, y + 1, nw - 2, half, st["hist"]["rx"], 0, top)
+    history_bars(s, x + 1, y + 1 + half, nw - 2, bh - 2 - half, st["hist"]["tx"], 0, top)
+
+    # ---- band 2: temperatures | fans ----------------------------------------------------
+    y, bh = y + 17, 15
+    fans = st["fans"]
+    board_pwm = {p[1]: p for p in pwms if p[0] == "Board"}
+    gpu_pwm = next((p for p in pwms if p[0] == "GPU"), None)
+    fw = 2 + len(fans) * 5 + 1
+    tw = w - fw
+    hottest = max((t[2] for t in temps_all), default=0)
+    eqbox(s, 0, y, tw, bh, "temp", f"{hottest:.0f}°C", heat((hottest - 20) / 80))
+    order = sorted(temps_all, key=lambda t: (GROUP_ORDER.index(t[0]) if t[0] in GROUP_ORDER else 99))
+    tf = [(t[2] - 20) / (((t[3] or 100) if (t[3] or 100) < 130 else 100) - 20) for t in order]
+    groups_lab, last = [], None
+    for t in order:
+        lab_ = {"Board": "BD", "NVMe": "SS", "Wi-Fi": "WF", "ACPI": "AC"}.get(t[0], t[0][:2]) if t[0] != last else ""
+        groups_lab.append(lab_)
+        last = t[0]
+    eqgroup(s, 2, y + 1, tw - 4, bh - 2, tf, peaks, "temp", labels=groups_lab)
+    x = tw
+    rpm_top = max([f[1] for f in fans] + [2000])
+    eqbox(s, x, y, fw, bh, "fans", f"{sum(1 for f in fans if f[1] > 0)}/{len(fans)}", "C")
+    for i, (name, rpm) in enumerate(fans):
+        fx = x + 2 + i * 5
+        num = re.search(r"(\d+)$", name)
+        p = gpu_pwm if name.startswith("GPU") else (board_pwm.get(int(num.group(1))) if num else None)
+        eqbar(s, fx, y + 1, bh - 3, 2, rpm / rpm_top, peaks, f"fan{i}", "C")
+        eqbar(s, fx + 2, y + 1, bh - 3, 1, p[2] if p else 0, None, None, "B")
+        s.put(fx, y + bh - 2, ("GP" if name.startswith("GPU") else f"F{num.group(1) if num else '?'}"), DIM)
+
+    # ---- band 3: load history | power | voltage rails -----------------------------------
+    y = y + bh
+    bh = h - y
+    vw = 2 + len(volts) * 4 + 1 if volts else 0
+    pw = 32
+    lw = w - vw - pw
+    eqbox(s, 0, y, lw, bh, "load", "cpu ▲  gpu ▼", DIM)
+    halfh = (bh - 2) // 2
+    history_bars(s, 1, y + 1, lw - 2, halfh, st["hist"]["cpu"], 0, 100)
+    history_bars(s, 1, y + 1 + halfh, lw - 2, bh - 2 - halfh, st["hist"]["gpu"], 0, 100)
+    x = lw
+    eqbox(s, x, y, pw, bh, "power", f"{gpow or 0:.0f}W" if gpow is not None else "", heat((gpow or 0) / (gcap or 1)))
+    history_bars(s, x + 1, y + 1, pw - 2, bh - 2, pn.hist["gpw"], 0, gcap or 100)
+    if vw:
+        x += pw
+        eqbox(s, x, y, vw, bh, "rails", f"{len(volts)}", DIM)
+        for i, (grp, name, v) in enumerate(volts):
+            key = f"{grp}{name}"
+            avg = pn.vavg.get(key, v)
+            pn.vavg[key] = avg * 0.95 + v * 0.05
+            dev = (v - avg) / avg if avg else 0
+            slider(s, x + 3 + i * 4, y + 1, bh - 3, dev, 0.30 if name in ("VCORE", "VDDGFX") else 0.06)
+            s.put(x + 2 + i * 4, y + bh - 2, f"{v:.1f}"[:3], DIM)
+
 def main():
     ap = argparse.ArgumentParser(description="one-page hardware dashboard for a terminal or Linux console")
     ap.add_argument("--config", default=os.path.expanduser("~/.config/hwdeck/config.toml"))
     ap.add_argument("--interval", type=float, default=None, help="seconds between refreshes (default 2)")
     ap.add_argument("--once", action="store_true", help="draw one frame and exit (for testing)")
-    ap.add_argument("--style", choices=["panel", "glance"], help="panel: control-room lamps (default, needs 120x46); glance: big numerals")
+    ap.add_argument("--style", choices=["eq", "panel", "glance"],
+                    help="eq: equalizer bars (default); panel: control-room lamps; glance: big numerals. eq/panel need 120x46")
     ap.add_argument("--version", action="version", version=f"hwdeck {VERSION}")
     args = ap.parse_args()
 
@@ -1075,7 +1286,7 @@ def main():
     extra_cmds = cfg.get("extra", {}).get("commands", [])
 
     cpu, gpu = Cpu(), Gpu()
-    style = args.style or cfg.get("style", "panel")
+    style = args.style or cfg.get("style", "eq")
     pn = Panel()
     hist = {k: deque(maxlen=HIST) for k in ("cpu", "gpu", "gpw", "mem", "rx", "tx")}
     last_net, last_io, slow_t = None, None, 0
@@ -1122,6 +1333,8 @@ def main():
                      "disks": mounts(), "io": io_rate, "services": services, "extra": extra}
             if w < 100 or h < 40:
                 s.put(0, 0, f"hwdeck needs at least 100x40, this terminal is {w}x{h}", "Y")
+            elif style == "eq" and w >= 120 and h >= 46:
+                draw_eq(s, state, cfg, pn)
             elif style == "panel" and w >= 120 and h >= 46:
                 draw_panel(s, state, cfg, pn)
             else:
