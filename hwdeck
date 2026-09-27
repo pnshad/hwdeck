@@ -1615,13 +1615,272 @@ def draw_bunker(s, st, cfg, pn):
         right = extra if extra and len(extra) <= room else right[:room]
     s.put(w - 1 - len(right), y, right, "y", "K")
 
+# =================================================================== btop ====
+# The same fields in btop's design language: a coloured border per box with its title
+# (and a red hotkey digit) set into the top edge, gradient graphs, ■ meters with a dim
+# remainder, dense per-core rows, small grey labels, clock centred in the top border.
+# 16-colour mapping of btop's default theme: cpu green, mem olive, net purple,
+# gpu cyan, thermal red, power yellow.
+
+BT = {"cpu": "g", "mem": "y", "net": "m", "gpu": "c", "temp": "r", "cool": "b", "power": "y", "sys": "K"}
+
+def bt_grad(frac):
+    return "G" if frac < 0.50 else ("Y" if frac < 0.75 else ("y" if frac < 0.90 else "R"))
+
+def bt_box(s, x, y, w, h, num, title, color, centre=None, right=None):
+    s.put(x, y, "┌" + "─" * (w - 2) + "┐", color)
+    for i in range(1, h - 1):
+        s.put(x, y + i, "│", color)
+        s.put(x + w - 1, y + i, "│", color)
+    s.put(x, y + h - 1, "└" + "─" * (w - 2) + "┘", color)
+    s.put(x + 2, y, "┐", color)
+    s.put(x + 3, y, str(num), "R")
+    s.put(x + 3 + len(str(num)), y, title, "W")
+    s.put(x + 3 + len(str(num)) + len(title), y, "┌", color)
+    if centre:
+        cx = x + (w - len(centre) - 2) // 2
+        s.put(cx, y, "┐", color); s.put(cx + 1, y, centre, "W"); s.put(cx + 1 + len(centre), y, "┌", color)
+    if right:
+        rx = x + w - len(right) - 4
+        s.put(rx, y, "┐", color); s.put(rx + 1, y, right, "w"); s.put(rx + 1 + len(right), y, "┌", color)
+
+def bt_meter(s, x, y, w, frac, color=None):
+    frac = max(0.0, min(1.0, frac))
+    n = round(frac * w)
+    for i in range(w):
+        if i < n:
+            s.put(x + i, y, "■", color or bt_grad((i + 1) / w))
+        else:
+            s.put(x + i, y, "■", "K")
+
+def bt_graph(s, x, y, w, h, data, lo, hi, grad=bt_grad, up=True):
+    """Filled history graph, two levels per cell; colour by height like btop's gradients.
+    up=False draws it hanging from the top (btop's mirrored upload graph)."""
+    vals = list(data)[-w:]
+    pad = w - len(vals)
+    for i, v in enumerate(vals):
+        f = 0.0 if hi <= lo else max(0.0, min(1.0, (v - lo) / (hi - lo)))
+        units = round(f * h * 2)
+        if units == 0 and v > lo:
+            units = 1
+        for r in range(h):
+            need = units - r * 2
+            if need <= 0:
+                continue
+            yy = (y + h - 1 - r) if up else (y + r)
+            ch = "█" if need >= 2 else ("▄" if up else "▀")
+            s.put(x + pad + i, yy, ch, grad((r + 1) / h))
+
+def core_ids(n):
+    ids = []
+    for i in range(n):
+        c = read(f"/sys/devices/system/cpu/cpu{i}/topology/core_id")
+        ids.append(int(c) if c and c.isdigit() else i)
+    return ids
+
+def draw_btop(s, st, cfg, pn):
+    w, h = s.w, s.h
+    pn.tick += 1
+    temps_all = [t for t in st["temps"] if not re.match(r"^(PECI|Sensor \d)", t[1]) and t[2] > 0.5]
+    temps = rank(st["temps"], cfg.get("hide_sensors", []))
+    g, m = st["gpu"], st["mem"]
+    cores = st["cores"]
+    gtemp, gpow, gcap = g.get("temp"), g.get("power"), g.get("power_cap") or 0
+    volts, powers, pwms, intr = all_channels(cfg)
+    k = pn.counters.sample()
+    pn.hist["gpw"].append(gpow or 0)
+    cpu_t = next((t for t in temps if t[0] == "CPU"), None)
+    core_temp = {}
+    for grp, lab, t, crit in temps:
+        mm = re.match(r"core (\d+)", lab)
+        if grp == "CPU" and mm:
+            core_temp[int(mm.group(1))] = t
+
+    # ================================================================ 1 cpu =========
+    ch = 15
+    host = (cfg.get("title") or st["host"])
+    up = st["uptime"]
+    bt_box(s, 0, 0, w, ch, 1, "cpu", BT["cpu"], centre=time.strftime("%H:%M:%S"),
+           right=f"{host}  up {int(up // 86400)}d {int(up % 86400 // 3600):02d}:{int(up % 3600 // 60):02d}")
+    pw_ = 56                                         # right panel: model + per-core rows
+    gx, gw = 1, w - pw_ - 3
+    bt_graph(s, gx, 1, gw, ch - 2, st["hist"]["cpu"], 0, 100)
+    s.put(gx + 1, 1, f"{st['cpu']:.0f}%", "W")
+    px = w - pw_ - 1
+    bt_box(s, px, 1, pw_, ch - 2, "", ascii_only(st["cpu_model"])[: pw_ - 12], BT["cpu"])
+    fq = core_freqs(len(cores))
+    favg = sum(c for c, _ in fq) / len(fq) if fq else 0
+    s.put(px + 2, 2, "CPU", "W")
+    bt_meter(s, px + 6, 2, pw_ - 25, st["cpu"] / 100)
+    s.put(px + pw_ - 18, 2, f"{st['cpu']:3.0f}%", "W")
+    if cpu_t:
+        s.put(px + pw_ - 13, 2, f"{cpu_t[2]:3.0f}°C", bt_grad((cpu_t[2] - 20) / 80))
+    s.put(px + pw_ - 7, 2, f"{favg:.1f}G", "w")
+    ids = core_ids(len(cores))
+    rows = max(1, min(ch - 6, -(-len(cores) // 2)))
+    colw = (pw_ - 3) // 2
+    for i, v in enumerate(cores[: rows * 2]):
+        cx = px + 2 + (i // rows) * (colw + 1)
+        cy = 3 + i % rows
+        s.put(cx, cy, f"C{i:<2}", "w")
+        bt_meter(s, cx + 4, cy, colw - 16, v / 100)
+        s.put(cx + colw - 11, cy, f"{v:3.0f}%", "W")
+        t = core_temp.get(ids[i])
+        if t is not None:
+            s.put(cx + colw - 6, cy, f"{t:3.0f}°C", bt_grad((t - 20) / 80))
+    ct = k.get("cpu", {})
+    ly = ch - 3
+    ey = 3 + rows
+    if ey + 1 < ly:
+        fmax = max((mx for _, mx in fq), default=0)
+        s.put(px + 2, ey + 1, "CLK", "w")
+        bt_meter(s, px + 6, ey + 1, pw_ - 25, favg / fmax if fmax else 0, "C")
+        s.put(px + pw_ - 18, ey + 1, f"{favg:.2f} / {fmax:.1f} GHz", "W")
+    if ey + 2 < ly:
+        s.put(px + 2, ey + 2, f"ctx {human(k.get('ctxt', 0), '')}/s   irq {human(k.get('intr', 0), '')}/s   run {k.get('running', 0)}"
+              f"   ni {ct.get('nice', 0) * 100:.0f}  si {ct.get('softirq', 0) * 100:.0f}", "w")
+    s.put(px + 2, ly, "Load AVG:", "w")
+    s.put(px + 12, ly, " ".join(f"{x:4.2f}" for x in st["load"]), "W")
+    s.put(px + 30, ly, f"us {ct.get('user', 0) * 100:3.0f} sy {ct.get('system', 0) * 100:3.0f} io {ct.get('iowait', 0) * 100:3.0f}", "w")
+
+    # ============================================================ 2 gpu | 3 mem ======
+    y, bh = ch, 13
+    half = w // 2
+    busy = g.get("busy", 0)
+    bt_box(s, 0, y, half, bh, 2, "gpu", BT["gpu"], right=ascii_only(st["gpu_name"] or "no gpu")[: half - 12])
+    if st.get("gpu_kind"):
+        bt_graph(s, 1, y + 1, half - 2, bh - 7, st["hist"]["gpu"], 0, 100)
+        s.put(2, y + 1, f"{busy:.0f}%", "W")
+        rows_ = [("Busy", busy / 100, f"{busy:5.1f}%"),
+                 ("VRAM", (g["vram_used"] / g["vram_total"]) if g.get("vram_total") else 0,
+                  f"{(g.get('vram_used') or 0) / 2**30:4.1f}/{(g.get('vram_total') or 0) / 2**30:.0f}G"),
+                 ("Power", (gpow / gcap) if gpow is not None and gcap else 0, f"{gpow or 0:4.0f}/{gcap:.0f}W"),
+                 ("Temp", ((gtemp - 20) / 90) if gtemp is not None else 0, f"{gtemp or 0:5.0f}°C"),
+                 ("Clock", (g.get("sclk") or 0) / (g.get("sclk_max") or 1), f"{g.get('sclk') or 0:4.0f}MHz")]
+        for i, (name, f, val) in enumerate(rows_):
+            yy = y + bh - 6 + i
+            s.put(2, yy, name, "w")
+            bt_meter(s, 9, yy, half - 23, f)
+            s.put(half - 13, yy, val.rjust(11), "W")
+    mx = half
+    mw = w - half
+    bt_box(s, mx, y, mw, bh, 3, "mem", BT["mem"], right=f"{m['total'] / 2**30:.1f} GiB")
+    root = next((d for d in st["disks"] if d[0] == "/"), st["disks"][0] if st["disks"] else None)
+    mrows = [("Used", m["used"], m["total"], None), ("Available", m["avail"], m["total"], "G"),
+             ("Cached", m["cached"], m["total"], "C"), ("Swap", m["swap_used"], m["swap_total"] or 1, "M")]
+    for i, (name, v, tot, c) in enumerate(mrows):
+        yy = y + 1 + i * 2
+        s.put(mx + 2, yy, f"{name}:", "w")
+        s.put(mx + mw - 12, yy, human(v).rjust(9), "W")
+        bt_meter(s, mx + 2, yy + 1, mw - 17, v / tot if tot else 0, c)
+        s.put(mx + mw - 14, yy + 1, f"{v / tot * 100 if tot else 0:3.0f}%", "w")
+    dy = y + 9
+    s.put(mx + 2, dy, "disks", "W")
+    s.put(mx + 9, dy, f"io ▼{human(st['io'][0])}/s ▲{human(st['io'][1])}/s", "w")
+    for i, (mnt, used, tot) in enumerate(st["disks"][: bh - 11]):
+        yy = dy + 1 + i
+        s.put(mx + 2, yy, ascii_only(mnt)[:10].ljust(10), "w")
+        bt_meter(s, mx + 13, yy, mw - 28, used / tot if tot else 0)
+        s.put(mx + mw - 14, yy, f"{used / tot * 100 if tot else 0:3.0f}%  {human(tot)}".rjust(12), "W")
+
+    # ======================================================== 4 temp | 5 cooling ====
+    y, bh = y + bh, 11
+    tw = 84
+    hottest = max((t[2] for t in temps_all), default=0)
+    bt_box(s, 0, y, tw, bh, 4, "temp", BT["temp"], right=f"hottest {hottest:.0f}°C  {len(temps_all)} sensors")
+    order = sorted(temps_all, key=lambda t: (GROUP_ORDER.index(t[0]) if t[0] in GROUP_ORDER else 99))
+    rows = bh - 2
+    ncol = -(-len(order) // rows)
+    colw = (tw - 2) // max(ncol, 1)
+    for i, (grp, lab, t, crit) in enumerate(order[: rows * ncol]):
+        cx = 1 + (i // rows) * colw
+        cy = y + 1 + i % rows
+        crit = crit if crit and crit < 130 else 100
+        f = (t - 20) / (crit - 20)
+        gs = {"Board": "BRD", "NVMe": "NVMe", "Wi-Fi": "Wi-Fi"}.get(grp, grp)
+        if grp == "RAM":
+            ram_i = sum(1 for o in order[:i] if o[0] == "RAM") + 1
+            name = f"RAM D{ram_i}"
+        else:
+            name = gs if lab.lower() in (grp.lower(), "composite", "wi-fi", "nic", "acpi") else f"{gs} {lab_short(lab)}"
+        s.put(cx + 1, cy, ascii_only(name)[:11].ljust(11), "w")
+        bt_meter(s, cx + 12, cy, colw - 19, f)
+        s.put(cx + colw - 6, cy, f"{t:3.0f}°C", bt_grad(f))
+    fx, fw = tw, w - tw
+    fans = st["fans"]
+    board_pwm = {p[1]: p for p in pwms if p[0] == "Board"}
+    gpu_pwm = next((p for p in pwms if p[0] == "GPU"), None)
+    bt_box(s, fx, y, fw, bh, 5, "cooling", BT["cool"], right=f"{sum(1 for f_ in fans if f_[1] > 0)}/{len(fans)} spinning")
+    s.put(fx + 2, y + 1, "fan", "K"); s.put(fx + 10, y + 1, "rpm", "K"); s.put(fx + fw - 12, y + 1, "pwm", "K")
+    for i, (name, rpm) in enumerate(fans[: bh - 3]):
+        yy = y + 2 + i
+        num = re.search(r"(\d+)$", name)
+        p = gpu_pwm if name.startswith("GPU") else (board_pwm.get(int(num.group(1))) if num else None)
+        s.put(fx + 2, yy, ("gpu" if name.startswith("GPU") else f"fan{num.group(1) if num else '?'}").ljust(6), "w")
+        bt_meter(s, fx + 8, yy, fw - 28, rpm / 3000, "B")
+        s.put(fx + fw - 20, yy, f"{rpm:5.0f}", "W")
+        if p:
+            bt_meter(s, fx + fw - 14, yy, 6, p[2], "b")
+            mode = {"0": "off", "1": "man", "2": "thm", "5": "auto"}.get(p[3] or "", "")
+            s.put(fx + fw - 7, yy, f"{p[2] * 100:3.0f}%", "w")
+
+    # ============================================================ 6 net | 7 power ====
+    y = y + bh
+    bh = h - y
+    nw = 50
+    _, rx, tx = st["net"]
+    iface = st["net"][0] or "net"
+    bt_box(s, 0, y, nw, bh, 6, "net", BT["net"], right=iface)
+    top = max(max(st["hist"]["rx"], default=0), max(st["hist"]["tx"], default=0), 64 * 1024)
+    hh = (bh - 2) // 2
+    down = lambda f: "b" if f < 0.5 else ("B" if f < 0.8 else "W")
+    upc = lambda f: "m" if f < 0.5 else ("M" if f < 0.8 else "W")
+    bt_graph(s, 1, y + 1, nw - 2, hh, st["hist"]["rx"], 0, top, down, up=True)
+    bt_graph(s, 1, y + 1 + hh, nw - 2, bh - 2 - hh, st["hist"]["tx"], 0, top, upc, up=False)
+    s.put(2, y + 1, f"▼ {human(rx)}/s", "W")
+    s.put(2, y + bh - 2, f"▲ {human(tx)}/s", "W")
+    s.put(nw - 16, y + 1, f"top {human(top)}/s"[:14], "K")
+    px, pw = nw, w - nw
+    bt_box(s, px, y, pw, bh, 7, "power", BT["power"], right=f"gpu {gpow or 0:.0f}W  vcore "
+           + (f"{next((v for gg, n_, v in volts if n_ == 'VCORE'), 0):.3f}V"))
+    gph = bh - 2
+    gpw_w = 16
+    bt_graph(s, px + 1, y + 1, gpw_w, gph, pn.hist["gpw"], 0, gcap or 100)
+    s.put(px + 2, y + 1, f"{gpow or 0:.0f}W", "W")
+    s.put(px + 2, y + bh - 2, "gpu power", "K")
+    rx0 = px + gpw_w + 2
+    rw = pw - gpw_w - 3
+    per = gph
+    ncol = -(-len(volts) // per) if volts else 1
+    colw = rw // max(ncol, 1)
+    for i, (grp, name, v) in enumerate(volts):
+        cx = rx0 + (i // per) * colw
+        cy = y + 1 + i % per
+        top_v = rail_scale(pn.vtop.setdefault(f"{grp}{name}", v))
+        s.put(cx, cy, {"VCORE": "vcore", "VDDGFX": "vgfx"}.get(name, name.lower())[:6].ljust(6), "w")
+        bt_meter(s, cx + 6, cy, colw - 14, v / top_v, "Y")
+        s.put(cx + colw - 7, cy, f"{v:5.3f}", "W")
+    # services + model along the bottom border
+    sx = 2
+    for u, stt in st["services"]:
+        name = ascii_only(u)
+        s.put(sx, h - 1, "┤", BT["power"] if sx > px else BT["net"])
+        s.put(sx + 1, h - 1, name, "G" if stt == "active" else "R")
+        s.put(sx + 1 + len(name), h - 1, "├", BT["power"] if sx > px else BT["net"])
+        sx += len(name) + 3
+        if sx > w - 30:
+            break
+    if st["extra"]:
+        e = ascii_only(st["extra"][0])
+        s.put(w - len(e) - 3, h - 1, f"┤{e}├", "y")
+
 def main():
     ap = argparse.ArgumentParser(description="one-page hardware dashboard for a terminal or Linux console")
     ap.add_argument("--config", default=os.path.expanduser("~/.config/hwdeck/config.toml"))
     ap.add_argument("--interval", type=float, default=None, help="seconds between refreshes (default 2)")
     ap.add_argument("--once", action="store_true", help="draw one frame and exit (for testing)")
-    ap.add_argument("--style", choices=["bunker", "eq", "panel", "glance"],
-                    help="bunker: heavy chassis of meters (default, needs 128x46); eq: equalizer bars; panel: control-room lamps; glance: big numerals. eq/panel need 120x46")
+    ap.add_argument("--style", choices=["bunker", "btop", "eq", "panel", "glance"],
+                    help="bunker: heavy chassis of meters (default, needs 128x46); btop: btop-style boxes; eq: equalizer bars; panel: control-room lamps; glance: big numerals. eq/panel need 120x46")
     ap.add_argument("--version", action="version", version=f"hwdeck {VERSION}")
     args = ap.parse_args()
 
@@ -1683,6 +1942,8 @@ def main():
                      "disks": mounts(), "io": io_rate, "services": services, "extra": extra}
             if w < 100 or h < 40:
                 s.put(0, 0, f"hwdeck needs at least 100x40, this terminal is {w}x{h}", "Y")
+            elif style == "btop" and w >= 128 and h >= 46:
+                draw_btop(s, state, cfg, pn)
             elif style == "bunker" and w >= 128 and h >= 46:
                 draw_bunker(s, state, cfg, pn)
             elif style == "eq" and w >= 120 and h >= 46:
