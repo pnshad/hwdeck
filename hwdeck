@@ -17,7 +17,7 @@ try:
 except ImportError:                      # Python < 3.11: config file is optional anyway
     tomllib = None
 
-VERSION = "0.4.0"
+VERSION = "0.5.0"
 HIST = 300
 
 # ================================================================= drawing ====
@@ -1332,13 +1332,296 @@ def draw_eq(s, st, cfg, pn):
               for grp, name, v in volts]
         eqgroup(s, x + 1, y + 1, w - x - 2, bh - 2, rf, peaks, "rail", labels=rl)
 
+# ================================================================= bunker ====
+# The default style: one heavy chassis of analyzer meters, read top to bottom
+# (A usage, B thermal + cooling, C power). Every LED position is always drawn, dark
+# when unlit, the way real panel meters look. Colour roles: g lit, y upper range and
+# readouts, R top segments and alarm, K unlit and walls, W peak caps. One loud element:
+# the hazard-striped master plate.
+
+def b_color(pos):
+    return "g" if pos <= 0.60 else ("y" if pos <= 0.85 else "R")
+
+def bbar(s, x, y, h, w, frac, peaks=None, key=None, color=None):
+    frac = max(0.0, min(1.0, frac))
+    lit = round(frac * h)
+    if frac > 0.01 and lit == 0:
+        lit = 1
+    peak = peaks.update(key, lit) if peaks is not None else 0
+    for r in range(h):
+        yy = y + h - 1 - r
+        if r < lit:
+            c = color or b_color((r + 1) / h)
+        elif peak > lit and r == peak - 1:
+            c = "W"
+        else:
+            c = "K"
+        s.put(x, yy, "▄" * w, c)
+
+def bgroup(s, x, y, w, h, fracs, peaks, prefix, labels=None, colors=None, widths=None):
+    """Bars spread over w cells, floor labels on the last row."""
+    n = len(fracs)
+    if not n:
+        return
+    bw = widths or max(1, min(3, (w + 1) // n - 1))
+    step = bw + 1
+    x0 = x + max(0, (w - (n * step - 1)) // 2)
+    for i, f in enumerate(fracs):
+        bx = x0 + i * step
+        if bx + bw > x + w:
+            break
+        bbar(s, bx, y, h - 1, bw, f, peaks, f"{prefix}{i}", colors[i] if colors else None)
+        if labels and labels[i]:
+            s.put(bx, y + h - 1, labels[i][: bw + (1 if bw < 3 else 0)], "y")
+
+def scale_rail(s, x, y, h, top="100", mid=" 50", bot="  0"):
+    """Tick rail on the left of a meter zone: labels plus ┤ ticks, floor row left blank."""
+    hh = h - 1
+    for r in range(hh):
+        s.put(x + 3, y + r, "┤" if r in (0, hh // 2, hh - 1) else "│", "K")
+    s.put(x, y, top[-3:].rjust(3), "K")
+    s.put(x, y + hh // 2, mid[-3:].rjust(3), "K")
+    s.put(x, y + hh - 1, bot[-3:].rjust(3), "K")
+
+def tag(s, x, y, code, name, dro="", dro_c="y", right=None):
+    """Stencil tag in a wall: ╡ A1 · CPU ╞, and a digital readout at the right end."""
+    if dro and right is not None:
+        room = right - x - len(dro) - 4 - (len(code) + 7)
+        name = name[: max(0, room)]
+    s.put(x, y, "╡ ", "K")
+    s.put(x + 2, y, code, "y")
+    if name:
+        s.put(x + 2 + len(code), y, " · ", "K")
+        s.put(x + 5 + len(code), y, name.upper(), "W")
+        s.put(x + 5 + len(code) + len(name), y, " ╞", "K")
+    else:
+        s.put(x + 2 + len(code), y, " ╞", "K")
+    if dro and right is not None:
+        d = f"╡ {dro} ╞"
+        s.put(right - len(d), y, "╡ ", "K")
+        s.put(right - len(d) + 2, y, dro, dro_c)
+        s.put(right - 2, y, " ╞", "K")
+
+def chassis(s, w, h, bands):
+    """bands: [(top_row, bottom_row, [wall x positions incl. 0 and w-1])]. Draws one rack."""
+    top, bottom = bands[0][0], bands[-1][1]
+    s.put(0, top, "╔" + "═" * (w - 2) + "╗", "K")
+    s.put(0, bottom, "╚" + "═" * (w - 2) + "╝", "K")
+    for r in range(top + 1, bottom):
+        s.put(0, r, "║", "K")
+        s.put(w - 1, r, "║", "K")
+    for i, (t, b, walls) in enumerate(bands):
+        if i > 0:
+            s.put(0, t, "╟" + "─" * (w - 2) + "╢", "K")
+        for x in walls[1:-1]:
+            for r in range(t + 1, b):
+                s.put(x, r, "│", "K")
+    for i, (t, b, walls) in enumerate(bands):
+        inner = walls[1:-1]
+        above = bands[i - 1][2][1:-1] if i > 0 else []
+        for x in set(inner) | set(above):
+            if i == 0:
+                s.put(x, t, "╤", "K")
+            else:
+                ch = "┼" if (x in inner and x in above) else ("┬" if x in inner else "┴")
+                s.put(x, t, ch, "K")
+    for x in bands[-1][2][1:-1]:
+        s.put(x, bottom, "╧", "K")
+
+def master_plate(s, x, y, w, worst, blink):
+    if worst >= 4:
+        bg, word = ("R" if blink else "r"), "MASTER ALARM"
+    elif worst == 3:
+        bg, word = "y", "MASTER CAUTION"
+    else:
+        bg, word = "K", "MASTER CLEAR"
+    text = f" {word} "
+    side = (w - len(text)) // 2
+    stripes = "/" * side
+    s.put(x, y, (stripes + text + "/" * (w - side - len(text)))[:w], "k", bg)
+
+def draw_bunker(s, st, cfg, pn):
+    w, h = s.w, s.h
+    pn.tick += 1
+    blink = pn.tick % 2 == 0
+    peaks = pn.peaks
+    temps_all = [t for t in st["temps"] if not re.match(r"^(PECI|Sensor \d)", t[1]) and t[2] > 0.5]
+    temps = rank(st["temps"], cfg.get("hide_sensors", []))
+    g, m = st["gpu"], st["mem"]
+    cores = st["cores"]
+    gtemp, gpow, gcap = g.get("temp"), g.get("power"), g.get("power_cap") or 0
+    root = next((d for d in st["disks"] if d[0] == "/"), st["disks"][0] if st["disks"] else None)
+    volts, powers, pwms, intr = all_channels(cfg)
+    k = pn.counters.sample()
+    cpu_t = next((t for t in temps if t[0] == "CPU"), None)
+
+    # ---- state for the master plate and the event log ---------------------------------
+    lv = {"CPU LOAD": level_load(st["cpu"] / 100),
+          "CPU TEMP": level_temp(cpu_t[2], cpu_t[3]) if cpu_t else 0,
+          "GPU LOAD": level_load(g.get("busy", 0) / 100) if st.get("gpu_kind") else 0,
+          "GPU TEMP": level_temp(gtemp, 110) if gtemp is not None else 0,
+          "GPU POWER": level_load(gpow / gcap) if gpow is not None and gcap else 0,
+          "MEMORY": level_load(m["used"] / m["total"]),
+          "DISK": level_load(root[1] / root[2]) if root else 0,
+          "HOT SPOT": max((level_temp(t[2], t[3]) for t in temps), default=0)}
+    down = [u for u, stt in st["services"] if stt != "active"]
+    lv["SERVICES"] = 4 if down else 0
+    for key, v in lv.items():
+        pn.note(key, v)
+    worst = max(lv.values(), default=0)
+
+    # ---- row 0: title plate + hazard master plate -------------------------------------
+    s.put(0, 0, " " * w, "y", "K")
+    unit = (cfg.get("title") or st["host"]).upper()
+    s.put(1, 0, "HWDECK", "W", "K")
+    s.put(8, 0, f"─ UNIT {unit} ─ PLANT MONITOR", "y", "K")
+    up = st["uptime"]
+    clock = f"T+{int(up // 86400):03d}D{int(up % 86400 // 3600):02d}H   {time.strftime('%H:%M:%S')}"
+    mp_w = 22
+    s.put(w - mp_w - 2 - len(clock), 0, clock, "W", "K")
+    master_plate(s, w - mp_w - 1, 0, mp_w, worst, blink)
+
+    # ---- chassis ----------------------------------------------------------------------
+    A = (1, 17, [0, 41, 72, 92, w - 1])
+    B = (17, 32, [0, 90, w - 1])
+    C = (32, h - 2, [0, 40, 67, w - 1])
+    chassis(s, w, h, [A, B, C])
+
+    def zone(band, i):
+        t, b, walls = band
+        x0, x1 = walls[i], walls[i + 1]
+        return x0, x1, t + 1, b - t - 1          # wall x, next wall x, first interior row, interior rows
+
+    # A1 CPU
+    x0, x1, zy, zh = zone(A, 0)
+    tag(s, x0 + 2, A[0], "A1", "cpu", f"{st['cpu']:05.1f}%", "y", x1 - 1)
+    scale_rail(s, x0 + 1, zy, zh)
+    bgroup(s, x0 + 5, zy, x1 - x0 - 5, zh, [c / 100 for c in cores], peaks, "core",
+           labels=[f"{i:02d}" for i in range(len(cores))])
+    # A2 GPU
+    x0, x1, zy, zh = zone(A, 1)
+    busy = g.get("busy", 0)
+    tag(s, x0 + 2, A[0], "A2", "gpu", f"{busy:05.1f}%", "y", x1 - 1)
+    scale_rail(s, x0 + 1, zy, zh)
+    if st.get("gpu_kind"):
+        gf = [busy / 100, (g["vram_used"] / g["vram_total"]) if g.get("vram_total") else 0,
+              (gpow / gcap) if gpow is not None and gcap else 0, ((gtemp - 20) / 90) if gtemp is not None else 0,
+              min(1.0, (g.get("fan") or 0) / 3000), (g.get("sclk") or 0) / (g.get("sclk_max") or 1),
+              (g.get("mclk") or 0) / (g.get("mclk_max") or 1)]
+        bgroup(s, x0 + 5, zy, x1 - x0 - 5, zh, gf, peaks, "gpu", labels=["BS", "VR", "PW", "TM", "FN", "CK", "MK"])
+    # A3 MEM
+    x0, x1, zy, zh = zone(A, 2)
+    tag(s, x0 + 2, A[0], "A3", "mem", f"{m['used'] / 2**30:04.1f}G", "y", x1 - 1)
+    bgroup(s, x0 + 1, zy, x1 - x0 - 2, zh,
+           [m["used"] / m["total"], m["cached"] / m["total"],
+            (m["swap_used"] / m["swap_total"]) if m["swap_total"] else 0, (root[1] / root[2]) if root else 0],
+           peaks, "mem", labels=["US", "CA", "SW", "DK"])
+    # A4 NET
+    x0, x1, zy, zh = zone(A, 3)
+    _, rx, tx = st["net"]
+    tag(s, x0 + 2, A[0], "A4", "net", f"{rx / 1024:06.1f}K", "y", x1 - 1)
+    scale_rail(s, x0 + 1, zy, zh, "1G", "10K", " 0")
+    nets = {n: v for n, v in k.get("net", {}).items() if n != "lo" and not n.startswith(("veth", "docker", "br-"))}
+    nf, nl = [], []
+    for n, (brx, prx, btx, ptx) in sorted(nets.items(), key=lambda kv: kv[0])[:5]:
+        code = {"w": "WL", "e": "EN", "t": "TS"}.get(n[0], n[:2].upper())
+        nf += [logf(brx, 10, 1e8), logf(btx, 10, 1e8)]
+        nl += [code[:1] + "▼", code[:1] + "▲"]
+    bgroup(s, x0 + 5, zy, x1 - x0 - 5, zh, nf, peaks, "net", labels=nl)
+
+    # B1 THERMAL
+    x0, x1, zy, zh = zone(B, 0)
+    hottest = max((t[2] for t in temps_all), default=0)
+    tag(s, x0 + 2, B[0], "B1", "thermal", f"{hottest:05.1f}°C", "R" if lv["HOT SPOT"] >= 3 else "y", x1 - 1)
+    scale_rail(s, x0 + 1, zy, zh, "100", " 60", " 20")
+    order = sorted(temps_all, key=lambda t: (GROUP_ORDER.index(t[0]) if t[0] in GROUP_ORDER else 99))
+    tf = [(t[2] - 20) / (((t[3] or 100) if (t[3] or 100) < 130 else 100) - 20) for t in order]
+    tl, last = [], None
+    for t in order:
+        tl.append({"Board": "BD", "NVMe": "SS", "Wi-Fi": "WF", "ACPI": "AC", "NIC": "NI"}.get(t[0], t[0][:2]).upper()
+                  if t[0] != last else "")
+        last = t[0]
+    bgroup(s, x0 + 5, zy, x1 - x0 - 5, zh, tf, peaks, "temp", labels=tl)
+    # B2 COOLING
+    x0, x1, zy, zh = zone(B, 1)
+    fans = st["fans"]
+    spinning = sum(1 for f in fans if f[1] > 0)
+    tag(s, x0 + 2, B[0], "B2", "cooling", f"{spinning}/{len(fans)}", "y", x1 - 1)
+    scale_rail(s, x0 + 1, zy, zh, "3K", "1.5", " 0")
+    board_pwm = {p[1]: p for p in pwms if p[0] == "Board"}
+    gpu_pwm = next((p for p in pwms if p[0] == "GPU"), None)
+    fx = x0 + 6
+    fstep = max(4, (x1 - x0 - 6) // max(len(fans), 1))
+    for i, (name, rpm) in enumerate(fans):
+        if fx + 3 > x1:
+            break
+        num = re.search(r"(\d+)$", name)
+        p = gpu_pwm if name.startswith("GPU") else (board_pwm.get(int(num.group(1))) if num else None)
+        bbar(s, fx, zy, zh - 1, 2, rpm / 3000, peaks, f"fan{i}")
+        bbar(s, fx + 2, zy, zh - 1, 1, p[2] if p else 0, None, None, "y")
+        s.put(fx, zy + zh - 1, "GP" if name.startswith("GPU") else f"F{num.group(1) if num else '?'}", "y")
+        fx += fstep
+
+    # C1 LOAD
+    x0, x1, zy, zh = zone(C, 0)
+    ct = k.get("cpu", {})
+    nc = max(len(cores), 1)
+    tag(s, x0 + 2, C[0], "C1", "load", f"{st['load'][0]:05.2f}", "y", x1 - 1)
+    scale_rail(s, x0 + 1, zy, zh)
+    bgroup(s, x0 + 5, zy, x1 - x0 - 5, zh,
+           [ct.get("user", 0), ct.get("system", 0), ct.get("iowait", 0), ct.get("irq", 0) + ct.get("softirq", 0),
+            ct.get("nice", 0), st["load"][0] / nc, st["load"][1] / nc, st["load"][2] / nc,
+            min(1.0, k.get("running", 0) / nc), logf(k.get("ctxt", 0), 100, 1e6), logf(k.get("intr", 0), 100, 1e6)],
+           peaks, "load", labels=["US", "SY", "IO", "IR", "NI", "L1", "L5", "LF", "RN", "CS", "IN"])
+    # C2 POWER
+    x0, x1, zy, zh = zone(C, 1)
+    gv = next((v for grp, name, v in volts if grp == "GPU"), None)
+    fq = core_freqs(len(cores))
+    fmax = max((mx for _, mx in fq), default=0)
+    favg = sum(c for c, _ in fq) / len(fq) if fq else 0
+    duty = [p[2] for p in pwms if p[3] not in ("0", None)]
+    tag(s, x0 + 2, C[0], "C2", "power", f"{gpow or 0:05.1f}W", "y", x1 - 1)
+    bgroup(s, x0 + 1, zy, x1 - x0 - 2, zh,
+           [(gpow / gcap) if gpow is not None and gcap else 0, ((gv or 0.7) - 0.7) / 0.5,
+            (g.get("sclk") or 0) / (g.get("sclk_max") or 1), (g.get("mclk") or 0) / (g.get("mclk_max") or 1),
+            favg / fmax if fmax else 0, sum(duty) / len(duty) if duty else 0],
+           peaks, "pow", labels=["GW", "GV", "GC", "GM", "CC", "FD"])
+    # C3 RAILS
+    x0, x1, zy, zh = zone(C, 2)
+    vc = next((v for grp, name, v in volts if name == "VCORE"), None)
+    tag(s, x0 + 2, C[0], "C3", "rails", f"{vc:05.3f}V" if vc else "-----", "y", x1 - 1)
+    scale_rail(s, x0 + 1, zy, zh, "MAX", "1/2", "  0")
+    rf = [v / rail_scale(pn.vtop.setdefault(f"{grp}{name}", v)) for grp, name, v in volts]
+    rl = [{"VCORE": "VC", "VDDGFX": "GV", "AVCC": "AV", "3VCC": "33", "3VSB": "SB", "VBAT": "BT"}.get(name, name[-2:])
+          for grp, name, v in volts]
+    bgroup(s, x0 + 5, zy, x1 - x0 - 5, zh, rf, peaks, "rail", labels=rl)
+
+    # ---- row 47: status strip ----------------------------------------------------------
+    y = h - 1
+    s.put(0, y, " " * w, "K", "K")
+    x = 1
+    for u, stt in st["services"]:
+        name = ascii_only(u).upper()
+        s.put(x, y, "▐", "g" if stt == "active" else "R", "K")
+        s.put(x + 1, y, name, "k", "g" if stt == "active" else ("R" if blink else "r"))
+        s.put(x + 1 + len(name), y, "▌", "g" if stt == "active" else "R", "K")
+        x += len(name) + 3
+    ev = list(pn.log)
+    last = f"{ev[-1][0]} {ev[-1][1]}" if ev else "ALL SYSTEMS NOMINAL"
+    extra = ascii_only(st["extra"][0]).upper() if st["extra"] else ""
+    room = w - x - 1
+    right = f"{extra} │ {last}" if extra else last
+    if len(right) > room:
+        right = extra if extra and len(extra) <= room else right[:room]
+    s.put(w - 1 - len(right), y, right, "y", "K")
+
 def main():
     ap = argparse.ArgumentParser(description="one-page hardware dashboard for a terminal or Linux console")
     ap.add_argument("--config", default=os.path.expanduser("~/.config/hwdeck/config.toml"))
     ap.add_argument("--interval", type=float, default=None, help="seconds between refreshes (default 2)")
     ap.add_argument("--once", action="store_true", help="draw one frame and exit (for testing)")
-    ap.add_argument("--style", choices=["eq", "panel", "glance"],
-                    help="eq: equalizer bars (default); panel: control-room lamps; glance: big numerals. eq/panel need 120x46")
+    ap.add_argument("--style", choices=["bunker", "eq", "panel", "glance"],
+                    help="bunker: heavy chassis of meters (default, needs 128x46); eq: equalizer bars; panel: control-room lamps; glance: big numerals. eq/panel need 120x46")
     ap.add_argument("--version", action="version", version=f"hwdeck {VERSION}")
     args = ap.parse_args()
 
@@ -1353,7 +1636,7 @@ def main():
     extra_cmds = cfg.get("extra", {}).get("commands", [])
 
     cpu, gpu = Cpu(), Gpu()
-    style = args.style or cfg.get("style", "eq")
+    style = args.style or cfg.get("style", "bunker")
     pn = Panel()
     hist = {k: deque(maxlen=HIST) for k in ("cpu", "gpu", "gpw", "mem", "rx", "tx")}
     last_net, last_io, slow_t = None, None, 0
@@ -1400,6 +1683,8 @@ def main():
                      "disks": mounts(), "io": io_rate, "services": services, "extra": extra}
             if w < 100 or h < 40:
                 s.put(0, 0, f"hwdeck needs at least 100x40, this terminal is {w}x{h}", "Y")
+            elif style == "bunker" and w >= 128 and h >= 46:
+                draw_bunker(s, state, cfg, pn)
             elif style == "eq" and w >= 120 and h >= 46:
                 draw_eq(s, state, cfg, pn)
             elif style == "panel" and w >= 120 and h >= 46:
