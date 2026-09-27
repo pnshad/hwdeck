@@ -17,7 +17,7 @@ try:
 except ImportError:                      # Python < 3.11: config file is optional anyway
     tomllib = None
 
-VERSION = "0.2.0"
+VERSION = "0.3.0"
 HIST = 300
 
 # ================================================================= drawing ====
@@ -247,6 +247,9 @@ class Gpu:
             g["vram_total"] = int(read(self.dev + "/mem_info_vram_total", "0") or 0)
             g["sclk"] = self._clock(self.dev + "/pp_dpm_sclk")
             g["mclk"] = self._clock(self.dev + "/pp_dpm_mclk")
+            for key in ("sclk", "mclk"):
+                lv_ = re.findall(r"(\d+)\s*Mhz", read(f"{self.dev}/pp_dpm_{key}", "") or "", re.I)
+                g[key + "_max"] = max(map(int, lv_)) if lv_ else None
             if self.hwmon:
                 p = read(self.hwmon + "/power1_average") or read(self.hwmon + "/power1_input")
                 g["power"] = int(p) / 1e6 if p else None
@@ -555,11 +558,509 @@ def spark(s, x, y, w, data, top, c):
         f = v / top if top else 0
         s.put(x + pad + i, y, "█" if f > 0.5 else ("▄" if f > 0.02 else "·"), c if f > 0.02 else DIM)
 
+# ============================================================ control room ====
+# The default style: an 80s plant-control panel in three bands, read top to bottom:
+#   USAGE    cpu cores, gpu, memory, storage + network   (ladders, traces, readouts)
+#   THERMAL  every temperature channel as a lamp, every fan with rpm + pwm duty
+#   POWER    every voltage rail, gpu power/voltage/clocks, batteries, cpu package power
+# lamp    : a tile whose background lights by level (off, normal, elevated, caution, alarm)
+# ladder  : a vertical LED meter of ■ segments, green low, amber high, red at the top
+# readout : zero-padded figures in brackets
+# Alarm lamps blink (every other refresh); nothing else moves.
+
+LEVEL_BG = ["K", "g", "G", "Y", "R"]          # off, normal, elevated, caution, alarm
+LEVEL_NAME = ["IDLE", "NORM", "HIGH", "CAUT", "ALRM"]
+
+def level_load(frac):
+    if frac < 0.05: return 0
+    if frac < 0.50: return 1
+    if frac < 0.80: return 2
+    if frac < 0.95: return 3
+    return 4
+
+def level_temp(t, crit):
+    if t is None: return 0
+    crit = crit or 100
+    if t >= crit - 5: return 4
+    if t >= crit - 15: return 3
+    if t >= crit - 35: return 2
+    return 1
+
+class Panel:
+    def __init__(self):
+        self.tick = 0
+        self.prev = {}
+        self.log = deque(maxlen=8)
+        self.vavg = {}                                  # rolling mean per voltage rail
+        self.hist = {k: deque(maxlen=HIST) for k in ("cpu_t", "gpu_t", "gpw", "cpw")}
+        self.rapl = None
+
+    def note(self, key, lvl):
+        old = self.prev.get(key)
+        self.prev[key] = lvl
+        if old is None:
+            return
+        rank_ = lambda l: 0 if l < 3 else l
+        if rank_(old) != rank_(lvl):
+            word = {0: "NOMINAL", 3: "CAUTION", 4: "ALARM"}[rank_(lvl)]
+            self.log.append((time.strftime("%H:%M:%S"), f"{key} {word}", rank_(lvl)))
+
+    def cpu_power(self):
+        """CPU package watts from RAPL; the counter is root-only on most kernels."""
+        path = "/sys/class/powercap/intel-rapl:0/energy_uj"
+        try:
+            with open(path) as f:
+                e = int(f.read())
+        except (OSError, ValueError):
+            return None
+        now = time.time()
+        watts = None
+        if self.rapl and e >= self.rapl[0]:
+            watts = (e - self.rapl[0]) / 1e6 / (now - self.rapl[1])
+        self.rapl = (e, now)
+        return watts
+
+def lamp(s, x, y, w, text, lvl, blink_on=True, lit_bg=None):
+    if w <= 0:
+        return
+    if lvl == 0:
+        s.put(x, y, text.center(w)[:w], "k", "K")
+        return
+    bg = lit_bg or LEVEL_BG[lvl]
+    if lvl == 4 and not blink_on:
+        bg = "r"
+    s.put(x, y, text.center(w)[:w], "k", bg)
+
+def ladder(s, x, y, h, w, frac):
+    lit = round(max(0.0, min(1.0, frac)) * h)
+    if frac > 0.01 and lit == 0:
+        lit = 1
+    for r in range(h):
+        pos = (r + 1) / h
+        c = "g" if pos <= 0.5 else ("G" if pos <= 0.75 else ("Y" if pos <= 0.9 else "R"))
+        s.put(x, y + h - 1 - r, ("■" * w) if r < lit else ("·" * w), c if r < lit else DIM)
+
+def hbar(s, x, y, w, frac, c=None):
+    """Horizontal LED bar: ■ segments, coloured by position like a ladder on its side."""
+    lit = round(max(0.0, min(1.0, frac)) * w)
+    for i in range(w):
+        pos = (i + 1) / w
+        cc = c or ("g" if pos <= 0.5 else ("G" if pos <= 0.75 else ("Y" if pos <= 0.9 else "R")))
+        s.put(x + i, y, "■" if i < lit else "·", cc if i < lit else DIM)
+
+def header(s, x, y, w, text, code=""):
+    plate = f" {text.upper()} "
+    s.put(x, y, "▐", ACCENT)
+    s.put(x + 1, y, plate, "k", ACCENT)
+    s.put(x + 1 + len(plate), y, "▌", ACCENT)
+    rule_x = x + 2 + len(plate)
+    end = x + w - (len(code) + 1 if code else 0)
+    s.put(rule_x, y, "═" * max(0, end - rule_x), DIM)
+    if code:
+        s.put(end, y, " " + code[: w - (end - x) - 1], DIM)
+
+def readout(s, x, y, name, value, c=INK):
+    s.put(x, y, name, DIM)
+    s.put(x + len(name), y, "[", DIM)
+    s.put(x + len(name) + 1, y, value, c)
+    s.put(x + len(name) + 1 + len(value), y, "]", DIM)
+
+def trace(s, x, y, w, h, data, lo, hi, color):
+    for r in range(h):
+        for cx in range(0, w, 4):
+            s.put(x + cx, y + r, "·", "K")
+    vals = list(data)[-w:]
+    pad = w - len(vals)
+    for i, v in enumerate(vals):
+        frac = 0.0 if hi <= lo else max(0.0, min(1.0, (v - lo) / (hi - lo)))
+        units = round(frac * h * 2)
+        if units == 0 and v > lo:
+            units = 1
+        for r in range(h):
+            need = units - r * 2
+            if need >= 2:
+                s.put(x + pad + i, y + h - 1 - r, "█", color)
+            elif need == 1:
+                s.put(x + pad + i, y + h - 1 - r, "▄", color)
+
+def spread(total, n):
+    """Split `total` cells into n widths that add up exactly."""
+    base, extra = divmod(total, n)
+    return [base + (1 if i < extra else 0) for i in range(n)]
+
+def lamp_grid(s, x, y, w, rows, items, blink):
+    """items: (top text, bottom text, level). Two-row lamps packed to fill w exactly."""
+    if not items:
+        return
+    per = max(1, -(-len(items) // rows))
+    widths = spread(w - (per - 1), per)
+    for i, (top, bot, lvl) in enumerate(items[: per * rows]):
+        col, row = i % per, i // per
+        cx = x + sum(widths[:col]) + col
+        lamp(s, cx, y + row * 2, widths[col], top, lvl, blink)
+        lamp(s, cx, y + row * 2 + 1, widths[col], bot, lvl, blink)
+
+NCT_VOLTS = {"in0": "VCORE", "in2": "AVCC", "in3": "3VCC", "in7": "3VSB", "in8": "VBAT"}
+
+def all_channels(cfg):
+    """Every hwmon channel: temps, fans (+pwm), voltages, powers, intrusion. From `sensors -j`
+    when available (it applies board configs), with pwm/enable read from sysfs."""
+    js = {}
+    if shutil.which("sensors"):
+        try:
+            js = json.loads(run("sensors", "-j") or "{}")
+        except ValueError:
+            js = {}
+    volts, powers, intr = [], [], []
+    for chip, d in js.items():
+        grp = chip_group(chip)
+        for lab, fields in d.items():
+            if not isinstance(fields, dict):
+                continue
+            for k, v in fields.items():
+                if not isinstance(v, (int, float)):
+                    continue
+                if re.fullmatch(r"in\d+_input", k):
+                    name = NCT_VOLTS.get(lab, lab.upper()) if grp == "Board" else lab.upper()
+                    volts.append((grp, name, float(v)))
+                elif re.fullmatch(r"power\d+_(average|input)", k):
+                    powers.append((grp, lab.upper(), float(v)))
+                elif re.fullmatch(r"intrusion\d+_alarm", k):
+                    intr.append((lab.upper(), int(v)))
+    pwms = []
+    for hw in sorted(os.listdir("/sys/class/hwmon")) if os.path.isdir("/sys/class/hwmon") else []:
+        base = f"/sys/class/hwmon/{hw}"
+        name = read(base + "/name") or hw
+        for f in sorted(os.listdir(base), key=lambda x: (len(x), x)):
+            m = re.fullmatch(r"pwm(\d+)", f)
+            if m:
+                v = read(f"{base}/{f}")
+                en = read(f"{base}/pwm{m.group(1)}_enable")
+                if v and v.isdigit():
+                    pwms.append((chip_group(name), int(m.group(1)), int(v) / 255, en))
+    return volts, powers, pwms, intr
+
+def batteries():
+    res = []
+    base = "/sys/class/power_supply"
+    for ps in sorted(os.listdir(base)) if os.path.isdir(base) else []:
+        cap = read(f"{base}/{ps}/capacity")
+        if read(f"{base}/{ps}/scope") == "Device":     # peripherals: keyboards, mice
+            continue
+        if cap and cap.isdigit():
+            model = read(f"{base}/{ps}/model_name") or ps
+            status = read(f"{base}/{ps}/status") or ""
+            res.append((ascii_only(model), int(cap), status))
+    return res
+
+def core_freqs(n):
+    out = []
+    for i in range(n):
+        cur = read(f"/sys/devices/system/cpu/cpu{i}/cpufreq/scaling_cur_freq")
+        mx = read(f"/sys/devices/system/cpu/cpu{i}/cpufreq/cpuinfo_max_freq")
+        out.append((int(cur) / 1e6 if cur else 0.0, int(mx) / 1e6 if mx else 0.0))
+    return out
+
+def draw_panel(s, st, cfg, pn):
+    w, h = s.w, s.h
+    pn.tick += 1
+    blink = pn.tick % 2 == 0
+    temps_all = [t for t in st["temps"] if not re.match(r"^(PECI|Sensor \d)", t[1])]
+    temps = rank(st["temps"], cfg.get("hide_sensors", []))
+    g, m = st["gpu"], st["mem"]
+    cores = st["cores"]
+    cpu_t = next((t for t in temps if t[0] == "CPU"), None)
+    gtemp = g.get("temp")
+    gcap = g.get("power_cap") or 0
+    gpow = g.get("power")
+    root = next((d for d in st["disks"] if d[0] == "/"), st["disks"][0] if st["disks"] else None)
+    _, rx, tx = st["net"]
+    volts, powers, pwms, intr = all_channels(cfg)
+    bats = batteries()
+    cpw = pn.cpu_power()
+    pn.hist["cpu_t"].append(cpu_t[2] if cpu_t else 0)
+    pn.hist["gpu_t"].append(gtemp or 0)
+    pn.hist["gpw"].append(gpow or 0)
+    pn.hist["cpw"].append(cpw or 0)
+
+    lv = {
+        "CPU LOAD": level_load(st["cpu"] / 100),
+        "CPU TEMP": level_temp(cpu_t[2], cpu_t[3]) if cpu_t else 0,
+        "GPU LOAD": level_load(g.get("busy", 0) / 100) if st.get("gpu_kind") else 0,
+        "GPU TEMP": level_temp(gtemp, 110) if gtemp is not None else 0,
+        "GPU PWR": level_load(gpow / gcap) if gpow is not None and gcap else 0,
+        "VRAM": level_load(g["vram_used"] / g["vram_total"]) if g.get("vram_total") else 0,
+        "MEMORY": level_load(m["used"] / m["total"]),
+        "SWAP": level_load(m["swap_used"] / m["swap_total"]) if m["swap_total"] else 0,
+        "DISK": level_load(root[1] / root[2]) if root else 0,
+        "HOT SPOT": max((level_temp(t[2], t[3]) for t in temps), default=0),
+    }
+    down = [u for u, stt in st["services"] if stt != "active"]
+    lv["SERVICES"] = 4 if down else (1 if st["services"] else 0)
+    for k, v in lv.items():
+        pn.note(k, v)
+    worst = max(lv.values(), default=0)
+
+    # ---- row 0: title bar ------------------------------------------------------------
+    s.put(0, 0, " " * w, "k", "B")
+    s.put(0, 0, f" HWDECK // {(cfg.get('title') or st['host']).upper()} // PLANT MONITOR", "k", "B")
+    up = st["uptime"]
+    right = f"UP {int(up // 86400):03d}D {int(up % 86400 // 3600):02d}:{int(up % 3600 // 60):02d}   {time.strftime('%Y-%m-%d   %H:%M:%S')} "
+    s.put(w - len(right), 0, right, "k", "B")
+
+    # ---- rows 1-2: master annunciator -------------------------------------------------
+    names = ["MASTER CAUTION", "MASTER ALARM"] + list(lv.keys())
+    widths = spread(w - (len(names) - 1), len(names))
+    x = 0
+    for n, wid in zip(names, widths):
+        if n == "MASTER CAUTION":
+            l_, sub = (3, "ACTIVE") if worst == 3 else (0, "CLEAR")
+        elif n == "MASTER ALARM":
+            l_, sub = (4, "ACTIVE") if worst == 4 else (0, "CLEAR")
+        else:
+            l_, sub = lv[n], LEVEL_NAME[lv[n]]
+        if n.startswith("MASTER"):
+            lamp(s, x, 1, wid, "MASTER", l_, blink)
+            lamp(s, x, 2, wid, n.split()[1], l_, blink)
+        else:
+            lamp(s, x, 1, wid, n, l_, blink)
+            lamp(s, x, 2, wid, sub, l_, blink)
+        x += wid + 1
+
+    # ================================================================ USAGE =========
+    y = 3
+    wts = [36, 24, 21, 19]                                   # cpu | gpu | memory | io
+    cols = [(w - 3) * k // 100 for k in wts]
+    cols[-1] = (w - 3) - sum(cols[:-1])
+    cx = [0, cols[0] + 1, cols[0] + cols[1] + 2, cols[0] + cols[1] + cols[2] + 3]
+    lh = 8
+    # CPU: per-core ladders + load trace + freq lamps + readouts
+    cw_ = cols[0]
+    header(s, cx[0], y, cw_, "usage // cpu", f"{len(cores):02d}CH")
+    per_core_w = 3 if len(cores) * 3 <= cw_ - 8 else 2
+    nshow = min(len(cores), (cw_ - 8) // per_core_w)
+    for i in range(nshow):
+        ladder(s, cx[0] + i * per_core_w, y + 1, lh, per_core_w - 1, cores[i] / 100)
+        s.put(cx[0] + i * per_core_w, y + 1 + lh, f"{i:02d}"[: per_core_w], DIM)
+    fq = core_freqs(nshow)
+    for i, (cur, mx) in enumerate(fq):
+        f = cur / mx if mx else 0
+        lamp(s, cx[0] + i * per_core_w, y + 2 + lh, per_core_w - 1, "", 1 if f < 0.5 else (2 if f < 0.8 else 3))
+    tx0 = cx[0] + nshow * per_core_w
+    tw0 = cw_ - (tx0 - cx[0])
+    trace(s, tx0, y + 1, tw0, lh, st["hist"]["cpu"], 0, 100, "G")
+    s.put(tx0, y + 1 + lh, "LOAD TRACE"[:tw0], DIM)
+    s.put(tx0, y + 2 + lh, "<CORE CLK"[:tw0], DIM)
+    s.put(cx[0], y + 3 + lh, ascii_only(st["cpu_model"]).upper()[:cw_], DIM)
+    avgf = sum(c for c, _ in fq) / len(fq) if fq else 0
+    readout(s, cx[0], y + 4 + lh, "TOT", f"{st['cpu']:05.1f}%", heat(st["cpu"] / 100))
+    readout(s, cx[0] + 12, y + 4 + lh, "FRQ", f"{avgf:04.2f}G", INK)
+    readout(s, cx[0] + 23, y + 4 + lh, "LD", f"{st['load'][0]:04.2f}/{st['load'][1]:04.2f}"[: max(0, cw_ - 27)], INK2)
+    # GPU
+    gw_ = cols[1]
+    header(s, cx[1], y, gw_, "gpu", "GFX0")
+    if st.get("gpu_kind"):
+        gl = [("BSY", g.get("busy", 0) / 100), ("VRM", (g["vram_used"] / g["vram_total"]) if g.get("vram_total") else 0),
+              ("PWR", (gpow / gcap) if gpow is not None and gcap else 0), ("TMP", ((gtemp - 25) / 85) if gtemp is not None else 0)]
+        lw_ = max(2, (gw_ - 14 - (len(gl) - 1)) // len(gl))
+        for i, (n, f) in enumerate(gl):
+            ladder(s, cx[1] + i * (lw_ + 1), y + 1, lh, lw_, f)
+            s.put(cx[1] + i * (lw_ + 1), y + 1 + lh, n[:lw_], DIM)
+        rx1 = cx[1] + len(gl) * (lw_ + 1)
+        readout(s, rx1, y + 1, "BSY", f"{g.get('busy', 0):05.1f}%", heat(g.get("busy", 0) / 100))
+        if g.get("vram_total"):
+            readout(s, rx1, y + 2, "VRM", f"{g['vram_used'] / 2**30:04.1f}G", INK)
+            readout(s, rx1, y + 3, "CAP", f"{g['vram_total'] / 2**30:04.1f}G", INK2)
+        trace(s, rx1, y + 4, cx[1] + gw_ - rx1, lh - 3, st["hist"]["gpu"], 0, 100, "C")
+        s.put(cx[1], y + 2 + lh, ascii_only(st["gpu_name"] or "").upper()[:gw_], DIM)
+        readout(s, cx[1], y + 3 + lh, "CLK", f"{g.get('sclk') or 0:04.0f}M", INK2)
+        readout(s, cx[1] + 11, y + 3 + lh, "MCK", f"{g.get('mclk') or 0:04.0f}M", INK2)
+        readout(s, cx[1], y + 4 + lh, "PWR", f"{gpow or 0:05.1f}W", heat(gpow / gcap) if gpow and gcap else INK2)
+        fan = g.get("fan")
+        readout(s, cx[1] + 11, y + 4 + lh, "FAN", f"{fan if fan is not None else 0:04d}", "C")
+    else:
+        s.put(cx[1] + 2, y + 4, "NO GPU ON BUS", DIM)
+    # memory
+    mw_ = cols[2]
+    header(s, cx[2], y, mw_, "memory", "MEM0")
+    ml = [("USE", m["used"] / m["total"]), ("CAC", m["cached"] / m["total"]),
+          ("SWP", (m["swap_used"] / m["swap_total"]) if m["swap_total"] else 0)]
+    lw_ = max(2, (mw_ - 14 - (len(ml) - 1)) // len(ml))
+    for i, (n, f) in enumerate(ml):
+        ladder(s, cx[2] + i * (lw_ + 1), y + 1, lh, lw_, f)
+        s.put(cx[2] + i * (lw_ + 1), y + 1 + lh, n[:lw_], DIM)
+    rx2 = cx[2] + len(ml) * (lw_ + 1)
+    readout(s, rx2, y + 1, "USE", f"{m['used'] / 2**30:05.1f}G", heat(m["used"] / m["total"]))
+    readout(s, rx2, y + 2, "TOT", f"{m['total'] / 2**30:05.1f}G", INK2)
+    readout(s, rx2, y + 3, "CAC", f"{m['cached'] / 2**30:05.1f}G", INK2)
+    readout(s, rx2, y + 4, "AVL", f"{m['avail'] / 2**30:05.1f}G", INK2)
+    readout(s, rx2, y + 5, "SWP", f"{m['swap_used'] / 2**30:05.1f}G", INK2)
+    s.put(cx[2], y + 2 + lh, "MEMORY TRACE", DIM)
+    trace(s, cx[2], y + 3 + lh, mw_, 2, st["hist"]["mem"], 0, 100, "M")
+    # storage + network
+    iw_ = cols[3]
+    header(s, cx[3], y, iw_, "storage // net", "IO")
+    dl = [(mnt, used / tot if tot else 0) for mnt, used, tot in st["disks"][:2]]
+    for i, (mnt, f) in enumerate(dl):
+        s.put(cx[3], y + 1 + i * 2, ascii_only(mnt).upper()[:iw_ - 7], DIM)
+        s.put(cx[3] + iw_ - 5, y + 1 + i * 2, f"{f * 100:3.0f}%", heat(f))
+        hbar(s, cx[3], y + 2 + i * 2, iw_, f)
+    top_io = max(st["io"][0], st["io"][1], 1)
+    readout(s, cx[3], y + 5, "RD", f"{st['io'][0] / 2**20:06.2f}M", INK2)
+    readout(s, cx[3], y + 6, "WR", f"{st['io'][1] / 2**20:06.2f}M", INK2)
+    top = max(max(st["hist"]["rx"], default=0), max(st["hist"]["tx"], default=0), 64 * 1024)
+    readout(s, cx[3], y + 7, "RX", f"{rx / 1024:07.1f}K", "C")
+    trace(s, cx[3], y + 8, iw_, 2, st["hist"]["rx"], 0, top, "C")
+    readout(s, cx[3], y + 10, "TX", f"{tx / 1024:07.1f}K", "M")
+    trace(s, cx[3], y + 11, iw_, 2, st["hist"]["tx"], 0, top, "M")
+
+    # ============================================================== THERMAL =========
+    y = 16
+    header(s, 0, y, w, "thermal // cooling", f"{len(temps_all):02d} TEMP  {len(st['fans']):02d} FAN  {len(pwms):02d} PWM")
+    gshort = {"Board": "BRD", "NVMe": "NVME", "Wi-Fi": "WIFI"}
+    def tname(grp, lab):
+        gs, ls = gshort.get(grp, grp).upper(), lab_short(lab).upper().strip()
+        return gs if not ls or ls in (gs, grp.upper()) or grp.upper().startswith(ls) else f"{gs} {ls}"
+    ram_n = iter(range(1, 99))
+    titems = [((f"RAM D{next(ram_n)}" if grp == "RAM" else tname(grp, lab)), f"{t:05.1f}C" if t > 0.5 else "NO SIG",
+               level_temp(t, crit if crit and crit < 130 else 100) if t > 0.5 else 0)
+              for grp, lab, t, crit in sorted(temps_all, key=lambda t: (GROUP_ORDER.index(t[0]) if t[0] in GROUP_ORDER else 99))]
+    trows = 3 if len(titems) > 26 else 2
+    per = -(-len(titems) // trows)
+    if (w - (per - 1)) // max(per, 1) < 8:
+        trows = 3
+    lamp_grid(s, 0, y + 1, w, trows, titems, blink)
+    fy = y + 1 + trows * 2
+    # fans: one cell per fan header, rpm lamp + pwm bar + control mode
+    fan_rows = []
+    for name, rpm in st["fans"]:
+        fan_rows.append((name, rpm))
+    board_pwm = {p[1]: p for p in pwms if p[0] == "Board"}
+    gpu_pwm = next((p for p in pwms if p[0] == "GPU"), None)
+    n = len(fan_rows)
+    if n:
+        widths = spread(w - (n - 1), n)
+        x = 0
+        for (name, rpm), wid in zip(fan_rows, widths):
+            num = re.search(r"(\d+)$", name)
+            p = gpu_pwm if name.startswith("GPU") else (board_pwm.get(int(num.group(1))) if num else None)
+            l_ = 0 if rpm == 0 else (1 if rpm < 1500 else (2 if rpm < 2500 else 3))
+            short = ("GPU FAN" if name.startswith("GPU") else f"FAN {num.group(1) if num else '?'}")
+            lamp(s, x, fy, wid, short, l_, blink, lit_bg="c")
+            lamp(s, x, fy + 1, wid, f"{rpm:04.0f} RPM", l_, blink, lit_bg="c")
+            if p:
+                hbar(s, x, fy + 2, wid - 5, p[2], "C")
+                s.put(x + wid - 4, fy + 2, f"{p[2] * 100:3.0f}%", INK2)
+                mode = {"0": "OFF", "1": "MAN", "2": "THRM", "5": "AUTO"}.get(p[3] or "", p[3] or "")
+                s.put(x, fy + 3, f"PWM {mode}"[:wid], DIM)
+            x += wid + 1
+    ty = fy + 4
+    # temperature traces fill the rest of the band
+    halfw = (w - 1) // 2
+    s.put(0, ty, "CPU PKG TEMP", DIM)
+    trace(s, 13, ty, halfw - 13, 2, pn.hist["cpu_t"], 20, 100, "Y")
+    s.put(halfw + 1, ty, "GPU JNC TEMP", DIM)
+    trace(s, halfw + 14, ty, w - halfw - 14, 2, pn.hist["gpu_t"], 20, 110, "Y")
+
+    # ================================================================ POWER =========
+    y = ty + 2
+    header(s, 0, y, w, "power // electrical", f"{len(volts):02d} RAIL")
+    vitems = []
+    for grp, name, v in volts:
+        key = f"{grp}{name}"
+        avg = pn.vavg.get(key, v)
+        pn.vavg[key] = avg * 0.95 + v * 0.05
+        dev = abs(v - avg) / avg if avg else 0
+        lvl = 1 if dev < 0.03 else (3 if dev < 0.08 else 4)
+        vitems.append((f"{ {'Board': 'BRD'}.get(grp, grp)} {name}".upper(), f"{v:05.3f}V", lvl))
+    vrows = 2
+    lamp_grid(s, 0, y + 1, w, vrows, vitems, blink)
+    py = y + 1 + vrows * 2
+    # power readouts, gpu power trace, cpu power, batteries, intrusion
+    pw_ = (w - 2) // 3
+    x0, x1, x2 = 0, pw_ + 1, 2 * pw_ + 2
+    ph = h - py - 1
+    s.put(x0, py, "GPU POWER", DIM)
+    if gpow is not None:
+        s.put(x0 + 10, py, f"{gpow:05.1f}W / {gcap:03.0f}W", heat(gpow / gcap) if gcap else INK)
+    trace(s, x0, py + 1, pw_, max(1, ph - 1), pn.hist["gpw"], 0, gcap or 100, "Y")
+    s.put(x1, py, "CPU PACKAGE POWER", DIM)
+    if cpw is not None:
+        s.put(x1 + 18, py, f"{cpw:05.1f}W", INK)
+        trace(s, x1, py + 1, pw_, max(1, ph - 1), pn.hist["cpw"], 0, 125, "Y")
+    else:
+        lamp(s, x1 + 18, py, pw_ - 18, "RAPL: ROOT ONLY", 0)
+    gv = next((v for grp, name, v in volts if grp == "GPU"), None)
+    fq_all = core_freqs(len(cores))
+    fmax = max((mx for _, mx in fq_all), default=0)
+    favg = sum(c for c, _ in fq_all) / len(fq_all) if fq_all else 0
+    duty = [p[2] for p in pwms if p[3] not in ("0", None)]
+    budget = [("GPU PPT", (gpow / gcap) if gpow is not None and gcap else 0, f"{gpow or 0:03.0f}/{gcap:03.0f}W"),
+              ("GPU VDD", ((gv or 0) - 0.7) / 0.5, f"{(gv or 0) * 1000:04.0f}mV"),
+              ("GPU SCLK", (g.get("sclk") or 0) / (g.get("sclk_max") or 1), f"{g.get('sclk') or 0:04.0f}/{g.get('sclk_max') or 0:04.0f}"),
+              ("GPU MCLK", (g.get("mclk") or 0) / (g.get("mclk_max") or 1), f"{g.get('mclk') or 0:04.0f}/{g.get('mclk_max') or 0:04.0f}"),
+              ("CPU CLK", favg / fmax if fmax else 0, f"{favg:03.1f}/{fmax:03.1f}G"),
+              ("VRAM", (g["vram_used"] / g["vram_total"]) if g.get("vram_total") else 0,
+               f"{(g.get('vram_used') or 0) / 2**30:03.1f}/{(g.get('vram_total') or 0) / 2**30:02.0f}G"),
+              ("FAN DUTY", sum(duty) / len(duty) if duty else 0, f"{(sum(duty) / len(duty) * 100) if duty else 0:03.0f}% AVG"),
+              ("MEMORY", m["used"] / m["total"], f"{m['used'] / 2**30:04.1f}G"),
+              ("CPU LOAD", st["cpu"] / 100, f"{st['cpu']:05.1f}%"),
+              ("GPU BUSY", g.get("busy", 0) / 100, f"{g.get('busy', 0):05.1f}%"),
+              ("DISK /", (root[1] / root[2]) if root else 0, f"{(root[1] / root[2] * 100) if root else 0:05.1f}%"),
+              ("SWAP", (m["swap_used"] / m["swap_total"]) if m["swap_total"] else 0, f"{m['swap_used'] / 2**30:04.1f}G")]
+    for i, (name, f, val) in enumerate(budget[: ph - 1]):
+        yy = py + 1 + i
+        s.put(x1, yy, name.ljust(9), DIM)
+        hbar(s, x1 + 9, yy, pw_ - 9 - 13, max(0.0, min(1.0, f)))
+        s.put(x1 + pw_ - 12, yy, val.rjust(12)[:12], INK2)
+    by = py
+    for model, cap, status in bats[:3]:
+        s.put(x2, by, f"BAT {model.upper()}"[: pw_ - 12], DIM)
+        hbar(s, x2 + pw_ - 11, by, 6, cap / 100, "G" if cap > 30 else "Y")
+        s.put(x2 + pw_ - 4, by, f"{cap:3d}%", INK2)
+        by += 1
+    for name, al in intr:
+        lamp(s, x2 + (pw_ // 2) * (int(name[-1]) % 2 if name[-1].isdigit() else 0), by, pw_ // 2 - 1,
+             f"{name.replace('INTRUSION', 'CHASSIS ')} {'OPENED' if al else 'SHUT'}", 2 if al else 1, blink)
+        if not name[-1].isdigit() or int(name[-1]) % 2 == 1:
+            by += 1
+    # services lamps and the event log share the last lines of the third column
+    for u, stt in st["services"]:
+        if by >= h - 1:
+            break
+        lamp(s, x2, by, pw_, ascii_only(u).upper()[:pw_], 1 if stt == "active" else 4, blink)
+        by += 1
+    evs = list(pn.log)
+    if by < h - 1:
+        s.put(x2, by, "EVENT LOG".ljust(pw_, " "), DIM)
+        by += 1
+    for ts, txt, lvl in (evs[-(h - 1 - by):] if evs else []):
+        s.put(x2, by, f"{ts} {txt}"[:pw_], {0: "g", 3: "Y", 4: "R"}[lvl])
+        by += 1
+    if not evs and by < h - 1:
+        s.put(x2, by, f"{time.strftime('%H:%M:%S')} NO EVENTS", "g")
+    # ---- last row: event log ticker ------------------------------------------------------
+    ev = list(pn.log)
+    line = "   ".join(f"{t} {txt}" for t, txt, _ in ev[-3:]) or f"{time.strftime('%H:%M:%S')} ALL SYSTEMS NOMINAL"
+    extra = "   ".join(st["extra"])
+    s.put(0, h - 1, " " * w, "k", "K")
+    s.put(0, h - 1, f" EVT  {line}"[: w - len(extra) - 2], "k", "K")
+    if extra:
+        s.put(w - len(extra) - 1, h - 1, ascii_only(extra).upper(), "k", "K")
+
+def lab_short(label):
+    return (label.replace("package", "PKG").replace("junction", "JNC").replace("composite", "")
+            .replace("chipset", "PCH").replace("system", "SYS").replace("socket", "SKT")
+            .replace("DIMM ", "D").replace("core ", "C").replace("edge", "EDG").replace("mem", "MEM")
+            .replace("PCH_CHIP_TEMP", "PCH").replace("PCH_CHIP_CPU_MAX_TEMP", "PCHMX")
+            .replace("PCH_CPU_TEMP", "PCHCPU").replace("PCH_MCH_TEMP", "MCH").replace("AUXTIN", "AUX"))
+
 def main():
     ap = argparse.ArgumentParser(description="one-page hardware dashboard for a terminal or Linux console")
     ap.add_argument("--config", default=os.path.expanduser("~/.config/hwdeck/config.toml"))
     ap.add_argument("--interval", type=float, default=None, help="seconds between refreshes (default 2)")
     ap.add_argument("--once", action="store_true", help="draw one frame and exit (for testing)")
+    ap.add_argument("--style", choices=["panel", "glance"], help="panel: control-room lamps (default, needs 120x46); glance: big numerals")
     ap.add_argument("--version", action="version", version=f"hwdeck {VERSION}")
     args = ap.parse_args()
 
@@ -574,7 +1075,9 @@ def main():
     extra_cmds = cfg.get("extra", {}).get("commands", [])
 
     cpu, gpu = Cpu(), Gpu()
-    hist = {k: deque(maxlen=HIST) for k in ("cpu", "gpu", "mem", "rx", "tx")}
+    style = args.style or cfg.get("style", "panel")
+    pn = Panel()
+    hist = {k: deque(maxlen=HIST) for k in ("cpu", "gpu", "gpw", "mem", "rx", "tx")}
     last_net, last_io, slow_t = None, None, 0
     services, extra = [], []
     cpu.sample()                                          # prime the deltas
@@ -608,7 +1111,7 @@ def main():
                 extra = [(run("sh", "-c", c, timeout=5).strip().splitlines() or [""])[0] for c in extra_cmds]
                 slow_t = t0
             for k, v in (("cpu", total), ("gpu", g.get("busy", 0)), ("mem", mem["used"] / mem["total"] * 100),
-                         ("rx", rx), ("tx", tx)):
+                         ("rx", rx), ("tx", tx), ("gpw", g.get("power") or 0)):
                 hist[k].append(v)
             w, h = shutil.get_terminal_size((128, 48))
             s = Screen(w, h)
@@ -619,6 +1122,8 @@ def main():
                      "disks": mounts(), "io": io_rate, "services": services, "extra": extra}
             if w < 100 or h < 40:
                 s.put(0, 0, f"hwdeck needs at least 100x40, this terminal is {w}x{h}", "Y")
+            elif style == "panel" and w >= 120 and h >= 46:
+                draw_panel(s, state, cfg, pn)
             else:
                 draw(s, state, cfg)
             sys.stdout.write(s.render())
