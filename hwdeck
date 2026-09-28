@@ -1696,8 +1696,11 @@ def draw_btop(s, st, cfg, pn):
         if grp == "CPU" and mm:
             core_temp[int(mm.group(1))] = t
 
+    # spare rows beyond the 46-row minimum go to the cpu and gpu graphs first, not all to the bottom band
+    spare = max(0, h - 46)
+    ch = 15 + spare // 3
+    wide = w - w // 2 >= 110                         # wide screen: every split sits mid-screen
     # ================================================================ 1 cpu =========
-    ch = 15
     host = (cfg.get("title") or st["host"])
     up = st["uptime"]
     bt_box(s, 0, 0, w, ch, 1, "cpu", BT["cpu"], centre=time.strftime("%H:%M:%S"),
@@ -1744,7 +1747,7 @@ def draw_btop(s, st, cfg, pn):
     s.put(px + 30, ly, f"us {ct.get('user', 0) * 100:3.0f} sy {ct.get('system', 0) * 100:3.0f} io {ct.get('iowait', 0) * 100:3.0f}", "w")
 
     # ============================================================ 2 gpu | 3 mem ======
-    y, bh = ch, 13
+    y, bh = ch, 13 + spare // 3
     half = w // 2
     busy = g.get("busy", 0)
     bt_box(s, 0, y, half, bh, 2, "gpu", BT["gpu"], right=ascii_only(st["gpu_name"] or "no gpu")[: half - 12])
@@ -1768,16 +1771,18 @@ def draw_btop(s, st, cfg, pn):
     root = next((d for d in st["disks"] if d[0] == "/"), st["disks"][0] if st["disks"] else None)
     mrows = [("Used", m["used"], m["total"], None), ("Available", m["avail"], m["total"], "G"),
              ("Cached", m["cached"], m["total"], "C"), ("Swap", m["swap_used"], m["swap_total"] or 1, "M")]
+    ndisk = min(len(st["disks"]), max(0, bh - 11))
+    step = 2 + max(0, bh - 11 - ndisk) // 5          # spread spare rows between the meters
     for i, (name, v, tot, c) in enumerate(mrows):
-        yy = y + 1 + i * 2
+        yy = y + 1 + i * step
         s.put(mx + 2, yy, f"{name}:", "w")
         s.put(mx + mw - 12, yy, human(v).rjust(9), "W")
         bt_meter(s, mx + 2, yy + 1, mw - 17, v / tot if tot else 0, c)
         s.put(mx + mw - 14, yy + 1, f"{v / tot * 100 if tot else 0:3.0f}%", "w")
-    dy = y + 9
+    dy = y + 1 + 4 * step
     s.put(mx + 2, dy, "disks", "W")
     s.put(mx + 9, dy, f"io ▼{human(st['io'][0])}/s ▲{human(st['io'][1])}/s", "w")
-    for i, (mnt, used, tot) in enumerate(st["disks"][: bh - 11]):
+    for i, (mnt, used, tot) in enumerate(st["disks"][:ndisk]):
         yy = dy + 1 + i
         s.put(mx + 2, yy, ascii_only(mnt)[:10].ljust(10), "w")
         bt_meter(s, mx + 13, yy, mw - 28, used / tot if tot else 0)
@@ -1785,13 +1790,13 @@ def draw_btop(s, st, cfg, pn):
 
     # ======================================================== 4 temp | 5 cooling ====
     y, bh = y + bh, 11
-    tw = 84
+    tw = max(84, half) if wide else 84
     hottest = max((t[2] for t in temps_all), default=0)
     bt_box(s, 0, y, tw, bh, 4, "temp", BT["temp"], right=f"hottest {hottest:.0f}°C  {len(temps_all)} sensors")
     order = sorted(temps_all, key=lambda t: (GROUP_ORDER.index(t[0]) if t[0] in GROUP_ORDER else 99))
-    rows = bh - 2
-    ncol = -(-len(order) // rows)
-    colw = (tw - 2) // max(ncol, 1)
+    ncol = max(1, -(-len(order) // (bh - 2)))
+    rows = max(1, -(-len(order) // ncol))            # even columns, not two full + one stub
+    colw = (tw - 2) // ncol
     for i, (grp, lab, t, crit) in enumerate(order[: rows * ncol]):
         cx = 1 + (i // rows) * colw
         cy = y + 1 + i % rows
@@ -1827,7 +1832,7 @@ def draw_btop(s, st, cfg, pn):
     # ============================================================ 6 net | 7 power ====
     y = y + bh
     bh = h - y
-    nw = 50
+    nw = half if wide else 50
     _, rx, tx = st["net"]
     iface = st["net"][0] or "net"
     bt_box(s, 0, y, nw, bh, 6, "net", BT["net"], right=iface)
@@ -1844,14 +1849,14 @@ def draw_btop(s, st, cfg, pn):
     bt_box(s, px, y, pw, bh, 7, "power", BT["power"], right=f"gpu {gpow or 0:.0f}W  vcore "
            + (f"{next((v for gg, n_, v in volts if n_ == 'VCORE'), 0):.3f}V"))
     gph = bh - 2
-    gpw_w = 16
+    gpw_w = max(16, pw // 4) if wide else 16
     bt_graph(s, px + 1, y + 1, gpw_w, gph, pn.hist["gpw"], 0, gcap or 100)
     s.put(px + 2, y + 1, f"{gpow or 0:.0f}W", "W")
     s.put(px + 2, y + bh - 2, "gpu power", "K")
     rx0 = px + gpw_w + 2
     rw = pw - gpw_w - 3
-    per = gph
-    ncol = -(-len(volts) // per) if volts else 1
+    ncol = -(-len(volts) // gph) if volts else 1
+    per = -(-len(volts) // ncol) if volts else 1     # even columns, not one full + one stub
     colw = rw // max(ncol, 1)
     for i, (grp, name, v) in enumerate(volts):
         cx = rx0 + (i // per) * colw
