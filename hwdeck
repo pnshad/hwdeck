@@ -2534,11 +2534,16 @@ def vw_layout(s, st, top, hero, boxes, ncols):
     top = (top[0], top[1], top[2] if top[2] in (GREEN, AMBER, RED) else TEXT) + tuple(top[3:])
     vw_frame(s, *top)
     acc_ = TEXT
+    # the title's icon shows once: sections and readout facts repeating it go without
+    same = lambda i: i and top[0] and i == top[0]
     for b in ([hero] if hero else []) + boxes:
         b.setdefault("ac", acc_)
+        if same(b.get("icon")):
+            b["icon"] = ""
         for r in b.get("rows", []):
             if isinstance(r, dict):
                 r.setdefault("ac", acc_)
+                r["side"] = [("",) + tuple(t[1:]) if same(t[0]) else t for t in r.get("side", [])]
     iw, ih, gap = w - 4, h - 2, 3
     spans = [b for b in boxes if b.get("span")]         # full-width sections, right under the hero
     boxes = [b for b in boxes if not b.get("span")]
