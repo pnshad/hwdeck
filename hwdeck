@@ -2455,27 +2455,42 @@ def vw_layout(s, st, top, hero, boxes, ncols):
     w, h = s.w, s.h
     vw_frame(s, *top)
     iw, ih, gap = w - 4, h - 2, 3
+    spans = [b for b in boxes if b.get("span")]         # full-width sections, right under the hero
+    boxes = [b for b in boxes if not b.get("span")]
+    snat = sum(vw_nat(b) for b in spans)
     ncols = max(1, min(ncols, len(boxes))) if boxes else 1
     colw = lambda n: [(iw - gap * (n - 1)) // n + (1 if i < (iw - gap * (n - 1)) % n else 0) for i in range(n)]
     cw = min(colw(ncols))
     bigs = [(r, iw) for r in (hero or {}).get("rows", []) if isinstance(r, dict)]
     bigs += [(r, cw) for b in boxes for r in b.get("rows", []) if isinstance(r, dict)]
+    bigs += [(r, iw) for b in spans for r in b.get("rows", []) if isinstance(r, dict)]
     hgraph = 0 if not hero or not hero.get("graphs") or vw_side(hero, iw) else 3
     for r, _ in bigs:
         r["L"] = SEG_L
     hd = vw_nat(hero, False) + hgraph if hero else 0
-    dnat = max((sum(n for _, n in c) for c in th_pack([(i, vw_nat(b)) for i, b in enumerate(boxes)], ncols)), default=0)
+    cnat = max((sum(n for _, n in c) for c in th_pack([(i, vw_nat(b)) for i, b in enumerate(boxes)], ncols)), default=0)
+    dnat = snat + cnat
     hh = 0
     if hero:
-        if not boxes:
+        if not boxes and not spans:
             hh = ih
         elif hd + dnat <= ih:
             hh = hd + (int((ih - hd - dnat) * hero.get("grow", 0.6)) if hero.get("graphs") else 0)
         else:
             hh = max(min(hd, hero.get("min", max(6, ih // 2))), ih - dnat)
-        vw_box(s, 2, 1, iw, hh if boxes and ih - hh >= 3 else ih, hero, st, head=False)
-    if not boxes or ih - hh < 3:
+        vw_box(s, 2, 1, iw, hh if (boxes or spans) and ih - hh >= 3 else ih, hero, st, head=False)
+    if ih - hh < 3:
         return
+    # spans take their rows, and every row the columns do not need (their graphs grow)
+    y0, rest = 1 + hh, ih - hh
+    for i, b in enumerate(spans):
+        bh = min(rest, vw_nat(b) + (max(0, rest - snat - cnat) if i == 0 else 0))
+        if bh >= 2:
+            vw_box(s, 2, y0, iw, bh, b, st)
+        y0, rest = y0 + bh, rest - bh
+    if not boxes or rest < 3:
+        return
+    hh = ih - rest
     # a section shorter than four rows says little: drop the last sections until the rest fit
     nat = [(i, vw_nat(b)) for i, b in enumerate(boxes)]
     while len(nat) > 1 and max(sum(min(n, 4) for _, n in c) for c in th_pack(nat, ncols)) > ih - hh:
@@ -2484,7 +2499,7 @@ def vw_layout(s, st, top, hero, boxes, ncols):
     cols, _ = th_layout(nat, ncols, ih - hh)
     cws = colw(ncols)
     for ci, col in enumerate(cols):
-        x, y = 2 + sum(cws[:ci]) + gap * ci, 1 + hh
+        x, y = 2 + sum(cws[:ci]) + gap * ci, y0
         for i, bh in col:
             vw_box(s, x, y, cws[ci], bh, boxes[i], st)
             y += bh
@@ -2903,49 +2918,102 @@ def proc_cpu(pn, n):
     scale = 100 / os.sysconf("SC_CLK_TCK") / (t - pt) / (os.cpu_count() or 1)
     return sorted(((ascii_only(c), v * scale) for c, v in agg.items()), key=lambda r: -r[1])[:n]
 
+SMC_POWER = os.environ.get("HWDECK_SMC_POWER") or "/run/mac13-smc-power.json"
+# Apple SMC power keys -> (friendly name, guess), in the order "where it goes" lists them.
+# A root service on the Mac writes them every 2 s as {"t": unix, "watts": {key: W}}; the
+# PZ* keys are power limits and zones, not draw, and are left out.
+SMC_WATTS = (("PSTR", "system", False), ("PD0R", "adapter in", False), ("PCPT", "CPU package", False),
+             ("PCPC", "CPU cores", False), ("PCPG", "graphics", False), ("PPBR", "battery / platform", True))
+
+def smc_power():
+    """(watts by key, None) from the SMC power service's JSON, or (None, why) when it is
+    missing, unreadable or more than 10 s old."""
+    try:
+        with open(SMC_POWER) as f:
+            d = json.load(f)
+    except (OSError, ValueError):
+        return None, "SMC power service not running"
+    if not isinstance(d, dict) or time.time() - float(d.get("t") or 0) > 10:
+        return None, "SMC power readings are stale"
+    return d.get("watts") or {}, None
+
+def pw_rows(s, x, y, w, n, rows):
+    """Power rows like th_rows: friendly name, the raw key (with ? for a guess) where there is
+    room, a meter against the largest reading, and the watts. Returns rows drawn."""
+    kw = 7 if w >= 44 else 0
+    namew = max(8, min(20, w - 15 - kw))
+    top = max((r[3] for r in rows), default=1) or 1
+    shown = rows if len(rows) <= n else rows[: n - 1]
+    for i, (name, key, guess, v) in enumerate(shown):
+        s.put(x, y + i, name[:namew], ch(GREY))
+        if kw:
+            s.put(x + namew + 1, y + i, key + ("?" if guess else ""), ch(faint(GREY, 0.6)))
+        if w - namew - kw - 10 >= 3:
+            vw_meter(s, x + namew + 1 + kw, y + i, w - namew - kw - 10, v / top, VOLT)
+        s.put(x + w - 7, y + i, f"{v:5.1f} W", TEXT)
+    if len(rows) > n:
+        s.put(x, y + n - 1, f"+{len(rows) - n + 1} more", GREY)
+    return len(shown)
+
 def view_power(s, st, cfg, pn):
     b = battery_info()
+    smc, why = smc_power()
     doms, readable = rapl_domains(pn)
     ac = any(on for _, on in b["ac"]) if b else None
     st_ = b["status"] if b else "no battery"
-    watts = (b["watts"] or 0) if b else 0
+    bw = (b["watts"] or 0) if b else 0
     sign = {"Charging": "+", "Discharging": "-"}.get(st_, "")
-    way = {"Charging": "into the battery", "Discharging": "system draw"}.get(st_, "battery idle")
     pkg = next((w for n, w in doms if n.startswith("package")), None)
-    dw = th_hist(pn, "v:pw", watts)
-    top = max(max(dw), 10)
 
-    # the readout is what the battery sees: on battery that is the whole system's draw
-    side = [(IC["plug"] if ac else IC["bat"], "source", "AC adapter" if ac else ("battery" if b else "--")),
-            ("", "battery", f"{sign}{watts:.1f} W  {st_.lower()}" if b else "none")]
-    if b and b["full"]:
-        side.append(("", "charge", f"{b['now'] / b['full'] * 100:.0f}%", charge_c(b["now"] / b["full"] * 100, b["limit"])))
-    side.append((IC["cpu"], "package", f"{pkg:.1f} W" if pkg is not None else ("reading..." if readable else "not readable yet"),
-                 TEXT if pkg is not None else GREY))
-    rows = [{"big": f"{watts:4.1f}".replace(" ", "_"), "unit": "W", "c": VOLT, "side": side,
-             "row": ("watts", watts / top, f"{sign}{watts:.1f} W  {way}", VOLT)}]
-    hero = {"color": VOLT, "rows": rows, "rw": 56, "graphs": [(dw, 0, top, f"{sign}{watts:.1f} W  {way}", VOLT)]}
-
-    boxes = []
-    if readable:
-        rr = [(n, (w or 0) / max(pkg or 0, w or 0, 1), f"{w:.2f} W" if w is not None else "--", VOLT) for n, w in doms]
-        dp = th_hist(pn, "v:rapl", pkg or 0)
-        boxes.append({"title": "rapl", "icon": IC["cpu"], "color": VOLT, "right": f"{pkg:.1f} W" if pkg is not None else "",
-                      "rows": rr, "rw": 44, "graphs": [(dp, 0, max(max(dp), 5), f"{pkg or 0:.1f} W  package", VOLT)]})
+    # the readout is the whole system's draw from the SMC (PSTR), on AC or battery alike, the
+    # mean of the last three samples; without the service, what the battery sees
+    if smc is not None and "PSTR" in smc:
+        d, src = th_hist(pn, "v:pstr", smc["PSTR"]), "system · SMC PSTR"
     else:
-        boxes.append({"title": "rapl", "icon": IC["cpu"], "color": GREY, "right": "not readable yet",
-                      "rows": [(n_, None, "locked", None, GREY) for n_, _ in doms]
-                      + ["energy_uj is root-only here;", "lights up once readable"] if doms else ["no RAPL counters"]})
+        d, src = th_hist(pn, "v:pw", bw), "battery " + ("draw" if st_ == "Discharging" else st_.lower())
+    watts = sum(list(d)[-3:]) / len(list(d)[-3:])
+    top = max(max(d), 10)
+    side = [(IC["plug"] if ac else IC["bat"], "source", "AC adapter" if ac else ("battery" if b else "--"))]
+    if smc and ac and "PD0R" in smc:
+        side.append(("", "adapter", f"{smc['PD0R']:.1f} W in"))
+    if b:
+        side.append(("", "battery", f"{sign}{bw:.1f} W  {st_.lower()}"))
+        if b["full"]:
+            side.append(("", "charge", f"{b['now'] / b['full'] * 100:.0f}%", charge_c(b["now"] / b["full"] * 100, b["limit"])))
+    cpu_w = smc.get("PCPT") if smc else pkg
+    side.append((IC["cpu"], "cpu", f"{cpu_w:.1f} W package" if cpu_w is not None else "--"))
+    rows = [{"big": digits(min(watts, 999), 3), "unit": "W", "c": VOLT, "side": side,    # whole watts
+             "row": ("watts", watts / top, f"{watts:.1f} W  {src}", VOLT)}]
+    hero = {"color": VOLT, "rows": rows, "rw": 56}
+
+    # where it goes: the SMC's rails, full width, with the system's history under them
+    if smc is not None:
+        wr = [(name, key, guess, smc[key]) for key, name, guess in SMC_WATTS if key in smc]
+        where = {"title": "where it goes", "icon": IC["plug"], "color": VOLT, "span": True, "lines": len(wr),
+                 "right": "SMC watts", "fn": lambda s_, x, y, w, n: pw_rows(s_, x, y, w, n, wr), "rw": 56,
+                 "graphs": [(d, 0, top, f"{watts:.1f} W  {src}", VOLT)]}
+    else:
+        where = {"title": "where it goes", "icon": IC["plug"], "color": GREY, "span": True, "right": "",
+                 "rows": [why], "graphs": [(d, 0, top, f"{watts:.1f} W  {src}", VOLT)]}
+    boxes = [where]
     n = max(4, min(15, s.h // 3))
     procs = proc_cpu(pn, n)
     prow = [(name, v / 100, f"{v:5.1f}%", VOLT) for name, v in procs] or ["measuring..."]
     boxes.append({"title": "top", "icon": IC["cpu"], "color": VOLT, "right": "cpu share", "rows": prow,
-                  "lines": max(1, min(len(prow), 8))})
+                  "lines": max(1, min(len(prow), 6))})
+    # RAPL is secondary now that the SMC reports the package: last but the adapter
+    if readable:
+        rr = [(n_, (w or 0) / max(pkg or 0, w or 0, 1), f"{w:.2f} W" if w is not None else "--", VOLT) for n_, w in doms]
+        boxes.append({"title": "rapl", "color": VOLT, "right": f"{pkg:.1f} W" if pkg is not None else "", "rows": rr})
+    else:
+        boxes.append({"title": "rapl", "color": GREY, "right": "not readable yet",
+                      "rows": [(n_, None, "locked", None, GREY) for n_, _ in doms] + ["root-only for now"]
+                      if doms else ["no RAPL counters"]})
     if b:
         boxes.append({"title": "ac", "icon": IC["plug"], "color": GREEN if ac else GREY, "right": "online" if ac else "offline",
                       "rows": [(n_, None, "online" if on else "offline", None, GREEN if on else GREY) for n_, on in b["ac"]]
                       + [("current", None, f"{sign}{abs(b['cur'] or 0) / 1e6:.3f} A"), ("voltage", None, f"{(b['volt'] or 0) / 1e6:.2f} V")]})
-    vw_layout(s, st, (IC["plug"] if ac else IC["bat"], "power", VOLT, way), hero, boxes,
+    vw_layout(s, st, (IC["plug"] if ac else IC["bat"], "power", VOLT, src), hero, boxes,
               1 if s.w < 60 else (2 if s.w < 200 else 3))
 
 # -------------------------------------------------------------- network ----
