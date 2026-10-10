@@ -2069,12 +2069,18 @@ def th_rows(s, x, y, w, n, rows):
         s.put(x, y + n - 1, f"+{len(rows) - n + 1} more", GREY)
     return len(shown)
 
-def th_fans(s, x, y, w, n, fans):
-    """Fan rows: name, key, meter and rpm, then min / max / target / mode under it when each
-    fan has two rows."""
+def fan_follows(cpu):
+    """The temperature a fan loop answers to: the SMC's fan-control die key (TC0F) on a Mac,
+    else the hottest CPU sensor. Rows as vw_temps gives them; None without any."""
+    return next((r for r in cpu if r[1] == "TC0F"), max(cpu, key=lambda r: r[3], default=None))
+
+def th_fans(s, x, y, w, n, fans, fol=None):
+    """Fan rows: name, key, meter, rpm and % of max; under it, when each fan has two rows, the
+    temperature the fan follows and its min-max. On one row the temperature joins the value."""
     per = 2 if n >= 2 * len(fans) else 1
     kw = 6 if w >= 44 else 0
-    namew = max(6, min(14, w - 30 - kw))
+    namew = max(5, min(14, w - 30 - kw))
+    ff = (fol[3] - 20) / (fol[4] - 20) if fol else 0
     for i, (lab, key, rpm, lo, mx, tgt, man) in enumerate(fans[: max(1, n // per)]):
         yy = y + i * per
         f = rpm / mx if mx else 0
@@ -2082,16 +2088,23 @@ def th_fans(s, x, y, w, n, fans):
         s.put(x, yy, (lab if len(lab) <= namew else lab.split()[0])[:namew], GREY)
         if kw:
             s.put(x + namew + 1, yy, key[:5], faint(GREY, 0.6))
-        vw_meter(s, x + namew + 1 + kw, yy, max(3, w - namew - kw - 17), f, ICE)
-        s.put(x + w - 15, yy, f"{rpm:5d} rpm {f * 100:3.0f}%", TEXT)
+        val = [(f"{rpm:5d} rpm {f * 100:3.0f}%", TEXT)]
+        if per == 1 and fol:
+            val = [(f"{rpm:5d} {f * 100:3.0f}%", TEXT), (f" {fol[3]:3.0f}°", temp_c(ff))]
+        vl = vw_len(val)
+        if w - namew - kw - vl - 2 >= 3:
+            vw_meter(s, x + namew + 1 + kw, yy, w - namew - kw - vl - 2, f, ICE)
+        vw_runs(s, x + w - vl, yy, val, TEXT, vl)
         if per == 2:
-            mode = "manual" if man else "auto"
             room = w - namew - 1
-            tg = tgt if tgt is not None else "--"
-            txt = f"min {lo or 0}  max {mx or 0}  target {tg}  {mode}"
-            if len(txt) > room:
-                txt = f"{lo or 0}-{mx or 0} rpm  {mode}"
-            s.put(x + namew + 1, yy + 1, txt[:room], faint(GREY, 0.75))
+            fx = x + namew + 1
+            if fol:
+                t = f"follows {fol[3]:.0f}°C {fol[1]}  "
+                s.put(fx, yy + 1, t[:room], temp_c(ff))
+                fx, room = fx + len(t), room - len(t)
+            rng = f"{lo or 0}-{mx or 0} rpm  {'manual' if man else 'auto'}"
+            if len(rng) <= room or not fol:              # whole, or not at all
+                s.put(fx, yy + 1, rng[: max(0, room)], faint(GREY, 0.75))
     return min(len(fans), max(1, n // per)) * per
 
 def draw_thermal(s, st, cfg, pn):
@@ -2114,6 +2127,7 @@ def draw_thermal(s, st, cfg, pn):
         else:
             th_hist(pn, f"th:{z}", max(r[3] for r in zones[z]))
     hot = max(live, key=lambda t: t[4], default=None)
+    fol = fan_follows(zones.get("cpu", []))
     hf = (hot[4] - 20) / (hot[5] - 20) if hot else 0
     dh = th_hist(pn, "th:hot", hot[4] if hot else 0)
     acc = temp_c(hf)
@@ -2135,7 +2149,7 @@ def draw_thermal(s, st, cfg, pn):
     for z in order:
         if z == "fans":
             secs.append({"title": "fans", "icon": IC["fan"], "color": ICE, "right": f"{spin}/{len(fans)} spinning",
-                         "lines": 2 * len(fans), "rw": 64, "fn": lambda s_, x, y, w, n: th_fans(s_, x, y, w, n, fans),
+                         "lines": 2 * len(fans), "rw": 64, "fn": lambda s_, x, y, w, n: th_fans(s_, x, y, w, n, fans, fol),
                          "graphs": [(pn.hist["th:fans"], 0, 100, f"{pn.hist['th:fans'][-1]:.0f}%  fastest", ICE)]})
             continue
         rows = sorted(zones[z], key=lambda r: not r[1].startswith("temp"))   # hwmon chips first, then SMC
@@ -2449,7 +2463,7 @@ def vw_layout(s, st, top, hero, boxes, ncols):
         if not boxes:
             hh = ih
         elif hd + dnat <= ih:
-            hh = hd + ((ih - hd - dnat) * 3 // 5 if hero.get("graphs") else 0)
+            hh = hd + (int((ih - hd - dnat) * hero.get("grow", 0.6)) if hero.get("graphs") else 0)
         else:
             hh = max(min(hd, hero.get("min", max(6, ih // 2))), ih - dnat)
         vw_box(s, 2, 1, iw, hh if boxes and ih - hh >= 3 else ih, hero, st, head=False)
@@ -2704,8 +2718,7 @@ def view_fans(s, st, cfg, pn):
     if not fans:
         s.put(0, 0, "hwdeck fans: this machine has no hwmon fan channels", AMBER)
         return
-    cpu = vw_temps("cpu")
-    hot = max(cpu, key=lambda r: r[3], default=None)
+    hot = fan_follows(vw_temps("cpu"))
     ncols = max(1, min(len(fans), (s.w - 4) // 28, 3))  # side by side while each is 28 wide
     cw = (s.w - 4 - 3 * (ncols - 1)) // ncols
     boxes = []
@@ -3002,34 +3015,75 @@ def tailscale(pn):
     return out
 
 def net_rate(pn, iface):
-    """Bytes per second down and up on one interface since the last frame."""
+    """Bytes per second down and up on one interface since the last frame, raw (for the
+    graphs) and smoothed by an exponential moving average over about 5 s (for the readout)."""
     nd, now = netdev(), time.time()
     prev = pn.__dict__.get("netp")
     pn.netp = (iface, nd.get(iface), now)
+    raw = (0.0, 0.0)
     if prev and prev[0] == iface and prev[1] and iface in nd and now > prev[2]:
-        return tuple(max(0.0, (a - b) / (now - prev[2])) for a, b in zip(nd[iface], prev[1]))
-    return 0.0, 0.0
+        raw = tuple(max(0.0, (a - b) / (now - prev[2])) for a, b in zip(nd[iface], prev[1]))
+        k = 1 - 2.718281828 ** (-(now - prev[2]) / 5)
+        old = pn.__dict__.get("nema")
+        pn.nema = raw if old is None else tuple(o + (r - o) * k for o, r in zip(old, raw))
+    return raw, pn.__dict__.get("nema") or raw
 
-def rate(v):
-    """Bytes/s as (digits for the LED readout, unit): 12.3 KB/s, 456 KB/s, 1.2 MB/s."""
-    for unit, div in (("B/s", 1), ("KB/s", 1e3), ("MB/s", 1e6), ("GB/s", 1e9)):
-        if v / div < 999.5:
-            break
-    x = v / div
-    return (f"{x:4.1f}" if x < 99.95 and unit != "B/s" else f"{x:4.0f}").replace(" ", "_"), unit
+RATE_UNITS = (("B/s", 1), ("KB/s", 1e3), ("MB/s", 1e6), ("GB/s", 1e9))
+
+def rate_unit(v):
+    return next((i for i, (_, d) in enumerate(RATE_UNITS) if v / d < 1000), len(RATE_UNITS) - 1)
+
+def steady_unit(pn, v, hold=4):
+    """The readout's unit, which moves only after the value has wanted another unit (past
+    1000 of this one, or under 1) for `hold` seconds; meanwhile the digits clamp at 999.9."""
+    want, now = rate_unit(v), time.time()
+    cur, since = pn.__dict__.get("nunit", (None, None))
+    if cur is None or want == cur:
+        since = None
+    elif since is None:
+        since = now
+    elif now - since >= hold:
+        cur, since = want, None
+    pn.nunit = (want if cur is None else cur, since)
+    return pn.nunit[0]
+
+def rate(v, u=None):
+    """Bytes/s as text in its own (or the given) unit: 12.3 KB/s."""
+    u = rate_unit(v) if u is None else u
+    return f"{v / RATE_UNITS[u][1]:.1f} {RATE_UNITS[u][0]}"
+
+def dns_servers(iface):
+    """The resolvers in use: resolvectl's for the interface behind systemd-resolved's stub
+    (no root, ~5 ms), else resolv.conf's."""
+    ns = re.findall(r"^nameserver\s+(\S+)", read("/etc/resolv.conf", "") or "", re.M)
+    if iface and all(n.startswith("127.") for n in ns):
+        out = run("resolvectl", "dns", iface, timeout=1)
+        ns = out.split(":", 1)[1].split() if ":" in out else ns
+    return ns
+
+def iface_totals():
+    """Bytes down and up since boot on every interface but lo, from /proc/net/dev."""
+    out = []
+    for line in (read("/proc/net/dev", "") or "").splitlines()[2:]:
+        name, rest = line.split(":", 1)
+        f = rest.split()
+        if name.strip() != "lo" and len(f) > 8:
+            out.append((name.strip(), int(f[0]), int(f[8])))
+    return out
 
 def view_network(s, st, cfg, pn):
     route, gw = default_route()
     w = wifi_info()
     iface = cfg.get("net_interface") or route or (w or {}).get("if")
-    down, up = net_rate(pn, iface)
-    drx, dtx = th_hist(pn, "v:rx", down), th_hist(pn, "v:tx", up)
+    (down, up), (sd, su) = net_rate(pn, iface)
+    drx, dtx = th_hist(pn, "v:rx", down), th_hist(pn, "v:tx", up)     # the graphs stay raw
     ip = ipv4(iface)
     ts = tailscale(pn)
     q = (w or {}).get("q")
     icon = chr(WIFI_GLYPHS[min(3, q // 25)]) if NERD and q is not None else (IC["net"] if w else "")
-    txt = lambda v: " ".join(x.strip("_") for x in rate(v)).replace("_", "")
-    d_, du = rate(down)
+    # the readout: smoothed, in a unit that holds still, always "ddd.d" so its width never moves
+    u = steady_unit(pn, sd)
+    big = f"{min(sd / RATE_UNITS[u][1], 999.9):5.1f}".replace(" ", "_")
 
     side = []
     if w and w.get("SSID"):
@@ -3040,31 +3094,32 @@ def view_network(s, st, cfg, pn):
     else:
         side.append((icon, "link", f"{iface or 'none'}" + (" · wifi not connected" if w else "")))
     side.append(("", "ipv4", ip or "--"))
-    side.append(("", "up", txt(up)))
-    rows = [{"big": d_, "unit": du, "c": LIME, "side": side, "row": ("down", None, f"{txt(down)}  up {txt(up)}", None, LIME)}]
+    side.append(("", "up", rate(su)))
+    rows = [{"big": big, "unit": RATE_UNITS[u][0].ljust(4), "c": LIME, "side": side,
+             "row": ("down", None, f"{rate(sd)}  up {rate(su)}", None, LIME)}]
     top_ = max(max(drx), max(dtx), 1024)
-    hero = {"color": LIME, "rows": rows, "rw": 56, "across": True,
-            "graphs": [(drx, 0, top_, f"down {txt(down)}", LIME), (dtx, 0, top_, f"up {txt(up)}", LIME)]}
+    hero = {"color": LIME, "rows": rows, "rw": 56, "across": True, "grow": 1,
+            "graphs": [(drx, 0, top_, f"down {rate(down)}", LIME), (dtx, 0, top_, f"up {rate(up)}", LIME)]}
 
     boxes = []
     if s.h >= 20:                                        # half a grid cell holds the hero alone
         if w:
-            wr = [("ssid", None, w.get("SSID") or "not connected"), ("interface", None, w["if"])]
+            wr = [("ssid", None, w.get("SSID") or "not connected")]
             if q is not None:
                 wr.append(("signal", q / 100, f"{w['dbm']} dBm  {q}", charge_c(q, 100)))
             if w.get("freq"):
-                wr.append(("band", None, f"{w.get('band', '')} ch {w.get('ch', '--')}  {float(w['freq']):.0f} MHz"))
-            for k in ("rx bitrate", "tx bitrate"):
-                if w.get(k):
-                    wr.append((k[:2] + " rate", None, w[k]))
-            boxes.append({"title": "wifi", "icon": icon, "color": LIME, "right": w.get("band", ""), "rows": wr})
-        boxes.append({"title": "ip", "color": LIME, "right": iface or "", "rows": [
-            ("ipv4", None, ip or "--"), ("gateway", None, gw or "--"), ("interface", None, iface or "--")]})
+                wr.append(("band", None, f"{w.get('band', '')} ch {w.get('ch', '--')} {float(w['freq']):.0f}"))
+            wr.append(("rx / tx", None, " / ".join(w.get(k, "--").replace(" Mb/s", "") for k in ("rx bitrate", "tx bitrate")) + " Mb/s"))
+            boxes.append({"title": "wifi", "icon": icon, "color": LIME, "right": w["if"], "rows": wr})
         if ts:
             boxes.append({"title": "tailscale", "color": LIME, "right": ts["state"].lower(), "rows": [
-                ("state", None, ts["state"], None, GREEN if ts["state"] == "Running" else AMBER),
-                ("address", None, ts["ip"]), ("peers", ts["online"] / max(1, ts["peers"]), f"{ts['online']}/{ts['peers']} online", LIME),
+                ("address", None, ts["ip"]),
+                ("peers", ts["online"] / max(1, ts["peers"]), f"{ts['online']}/{ts['peers']} online", LIME),
                 ("exit node", None, ts["exit"] or "none")]})
+        boxes.append({"title": "ip", "color": LIME, "right": iface or "", "rows": [
+            ("ipv4", None, ip or "--"), ("gateway", None, gw or "--"), ("dns", None, " ".join(dns_servers(iface)[:2]) or "--")]})
+        boxes.append({"title": "since boot", "color": LIME, "right": "down / up", "rows": [
+            (n, None, ((human(rx), TEXT), (" / ", GREY), (human(tx), TEXT))) for n, rx, tx in iface_totals()]})
     note = f"tailscale {ts['state'].lower()} · {ts['online']}/{ts['peers']} online" if ts else (iface or "")
     vw_layout(s, st, (icon or IC["net"], "network", LIME, note), hero, boxes, 1 if s.w < 60 else (2 if s.w < 200 else 3))
 
