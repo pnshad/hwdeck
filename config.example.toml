@@ -4,6 +4,10 @@
 # views: cpu, memory, fans, battery, power, network (--view on the command line wins over this).
 # style = "btop"
 
+# Views only: burn-in protection. The drawing orbits one cell every 3 minutes and the frame,
+# headings and labels dim a step after 30 minutes. false turns both off (as --no-orbit).
+# orbit = true
+
 # Shown instead of the hostname.
 # title = "workstation"
 

@@ -85,8 +85,17 @@ foot's padding matches, and gives it back on exit.
 | **`fans`** | One section per fan, side by side: rpm as the LED readout, % of max, the SMC target, min and max, auto or manual mode, the CPU temperature the fan loop is answering to, and an rpm history. |
 | **`battery`** | Charge as `charge_now / charge_full` (the kernel's `capacity` divides by the design capacity, which on a worn pack reads low; it is shown beside it), status, time to full or empty, the charge limit, the AC adapter, and a charge history. `power`: watts in or out, current, voltage, with a watts history. `health`: `charge_full` against `charge_full_design`, cycle count, chemistry and model. `temp`: the battery's hwmon sensor and the SMC keys `TB0T`, `TB1T`, `TB2T`, `TBXT`, with history. |
 | **`power`** | The battery's watts as the readout (`current_now` x `voltage_now`; on battery that is the whole system's draw), its history, the power source and charge. `rapl`: every RAPL domain (package, cores, uncore / GPU, DRAM) in watts; where `energy_uj` is root-only it says "not readable yet" and lights up once it is readable. `top`: CPU share per program since the last frame, from `/proc/*/stat`, as a cheap stand-in for who is drawing the power. `ac`: the adapter, current and voltage. |
-| **`network`** | Download rate as the readout, smoothed over about 5 s, in a unit that changes only after the rate has wanted another one for 4 s, and always `ddd.d` so it never changes width; with the Wi-Fi SSID, signal (dBm and the strip's 0-100, `2 x (dBm + 100)`), band and link rate, the IPv4 address and the upload rate beside it, and down / up graphs side by side (raw, not smoothed). Wi-Fi comes from `iw dev <if> link` (no root), else `/proc/net/wireless` and `nmcli -t`; the interface is the default route's (or `net_interface` in the config). On a taller window: `wifi` (signal, band, channel, frequency, rx / tx rates), `tailscale` (this node's tailnet address, peers online, exit node, from `tailscale status --json` at most every 15 s; the frame shows its state too), `ip` (address, gateway, DNS servers, via `resolvectl dns` behind systemd-resolved's stub) and `since boot` (bytes down / up per interface). |
+| **`network`** | The Wi-Fi signal as the readout, in % on the Touch Bar strip's scale `2 x (dBm + 100)` (clamped 0-100, the mean of the last three samples so it does not flicker; `--` and "no wifi" without a link). Beside it: the SSID, dBm, band and link rate, the IPv4 address, and the down and up rates, smoothed over about 5 s, each in a unit that changes only after the rate has wanted another one for 4 s and always `ddd.d` wide. Down / up graphs side by side under it (raw, not smoothed). Wi-Fi comes from `iw dev <if> link` (no root), else `/proc/net/wireless` and `nmcli -t`; the interface is the default route's (or `net_interface` in the config). On a taller window: `wifi` (signal, band, channel, frequency, rx / tx rates), `tailscale` (this node's tailnet address, peers online, exit node, from `tailscale status --json` at most every 15 s; the frame shows its state too), `ip` (address, gateway, DNS servers, via `resolvectl dns` behind systemd-resolved's stub) and `since boot` (bytes down / up per interface). |
 | **`thermal`** | The hottest sensor as the readout with the fans and sensor count beside it, then one section per zone (CPU, fans, battery, board, skin & air, storage; each fan with rpm, % of max and the temperature its loop follows, the SMC's `TC0F` on a Mac) with a meter per sensor in its temperature colour, and the channels that read nothing in a "no sensor" strip. |
+
+**Burn-in protection.** The views are meant to stay up for hours, and their frames and labels
+do not move. So every 3 minutes the whole drawing shifts one cell, round (0,0), (1,0), (1,1),
+(0,1) and back, inside a spare column and row kept free for it (every cell of a frame moves
+together, so nothing jumps mid-frame). After 30 minutes the chrome (frame, headings, labels)
+drops to about two thirds of its brightness; values, meters, readouts and graphs stay full.
+Restarting the view brings it back. Both are on by default; `--no-orbit` or `orbit = false`
+in the config turns them off. `HWDECK_ORBIT_SECONDS` and `HWDECK_DIM_SECONDS` override the
+3 minutes and 30 minutes, for a quick check.
 
 The charge limit is read from `charge_control_end_threshold`, on the battery or, on Intel
 Macs, on the `applesmc` platform device. Batteries that report energy (`energy_now`,
@@ -136,7 +145,7 @@ Ctrl-C to quit. For fan speeds, voltages and board temperatures install lm-senso
 module, for example `nct6775`.
 
 Options: `--style NAME` (`btop`, `bunker`, `eq`, `panel`, `glance`, `thermal`), `--view NAME`
-(`cpu`, `memory`, `fans`, `battery`, `power`, `network`, `thermal`; wins over `--style`), `--config FILE` (default
+(`cpu`, `memory`, `fans`, `battery`, `power`, `network`, `thermal`; wins over `--style`), `--no-orbit` (views: no burn-in protection), `--config FILE` (default
 `~/.config/hwdeck/config.toml`), `--interval SECONDS`, `--once` (draw one frame and exit). Every setting is optional; see
 [`config.example.toml`](config.example.toml).
 

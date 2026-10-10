@@ -62,6 +62,13 @@ def mix(a, b, t):
     t = max(0.0, min(1.0, t))
     return tuple(x + (y - x) * t for x, y in zip(a, b))
 
+CHROME = 1.0         # brightness of a view's static chrome; main() lowers it after a long run
+
+def ch(c):
+    """A colour of static chrome (frame, headings, labels) at the current CHROME brightness;
+    live values, meters, readouts and graphs never go through this."""
+    return c if CHROME >= 1 else mix(BLACK, c, CHROME)
+
 def faint(c, t=0.16):
     """`c` at low intensity on black: unlit LED segments, meter tracks, rules."""
     return mix(BLACK, c, t)
@@ -2059,9 +2066,9 @@ def th_rows(s, x, y, w, n, rows):
     shown = rows if len(rows) <= n else rows[: n - 1]
     for i, (name, key, guess, t, ceil) in enumerate(shown):
         f = (t - 20) / (ceil - 20)
-        s.put(x, y + i, ascii_only(name)[:namew], GREY)
+        s.put(x, y + i, ascii_only(name)[:namew], ch(GREY))
         if kw:
-            s.put(x + namew + 1, y + i, key[:5] + ("?" if guess else ""), faint(GREY, 0.6))
+            s.put(x + namew + 1, y + i, key[:5] + ("?" if guess else ""), ch(faint(GREY, 0.6)))
         if meterw >= 3:
             vw_meter(s, x + namew + 1 + kw, y + i, meterw, f, temp_c(f))
         s.put(x + w - 5, y + i, f"{t:3.0f}°C", temp_c(f))
@@ -2085,9 +2092,9 @@ def th_fans(s, x, y, w, n, fans, fol=None):
         yy = y + i * per
         f = rpm / mx if mx else 0
         lab = ascii_only(lab)
-        s.put(x, yy, (lab if len(lab) <= namew else lab.split()[0])[:namew], GREY)
+        s.put(x, yy, (lab if len(lab) <= namew else lab.split()[0])[:namew], ch(GREY))
         if kw:
-            s.put(x + namew + 1, yy, key[:5], faint(GREY, 0.6))
+            s.put(x + namew + 1, yy, key[:5], ch(faint(GREY, 0.6)))
         val = [(f"{rpm:5d} rpm {f * 100:3.0f}%", TEXT)]
         if per == 1 and fol:
             val = [(f"{rpm:5d} {f * 100:3.0f}%", TEXT), (f" {fol[3]:3.0f}°", temp_c(ff))]
@@ -2284,31 +2291,31 @@ def vw_frame(s, icon, title, c, right):
     """The view's one rounded frame: its edge in the accent, the icon and title set into the
     top edge in full accent, the clock and a note in grey."""
     w, h = s.w, s.h
-    edge = mix(BLACK, c, 0.55)
+    edge = ch(mix(BLACK, c, 0.55))
     s.put(0, 0, "╭" + "─" * (w - 2) + "╮", edge)
     for y in range(1, h - 1):
         s.put(0, y, "│", edge)
         s.put(w - 1, y, "│", edge)
     s.put(0, h - 1, "╰" + "─" * (w - 2) + "╯", edge)
     head = f" {icon} {title} " if icon else f" {title} "
-    s.put(2, 0, head, c)
+    s.put(2, 0, head, ch(c))
     note = f" {right} "[: max(0, w - len(head) - 8)] if right else ""
     rx = w - 3 - len(note)
     if len(note) > 3:
-        s.put(rx, 0, note, GREY)
+        s.put(rx, 0, note, ch(GREY))
     clock = f" {time.strftime('%H:%M:%S')} "
     cx = (w - len(clock)) // 2
     if cx > 3 + len(head) and cx + len(clock) < rx:
-        s.put(cx, 0, clock, GREY)
+        s.put(cx, 0, clock, ch(GREY))
 
 def vw_head(s, x, y, w, icon, title, c, right=""):
     """A section heading: icon and title in its colour, a faint rule, a grey note."""
     head = f"{icon} {title}" if icon else title
-    s.put(x, y, head[:w], c)
+    s.put(x, y, head[:w], ch(c))
     right = right[: max(0, w - len(head) - 6)]
-    s.put(x + len(head) + 1, y, "─" * max(0, w - len(head) - 1 - (len(right) + 1 if right else 0)), faint(c, 0.45))
+    s.put(x + len(head) + 1, y, "─" * max(0, w - len(head) - 1 - (len(right) + 1 if right else 0)), ch(faint(c, 0.45)))
     if right:
-        s.put(x + w - len(right), y, right, GREY)
+        s.put(x + w - len(right), y, right, ch(GREY))
 
 def vw_meter(s, x, y, w, frac, c):
     """A thin bar: lit in `c`, the rest a faint track of the same colour."""
@@ -2327,7 +2334,7 @@ def vw_runs(s, x, y, val, c, w):
 
 def vw_line(s, x, y, w, r, namew, valw, acc):
     name, frac, val, c, vc = (r + (None, TEXT))[:5] if len(r) == 3 else (r + (TEXT,))[:5]
-    s.put(x, y, name[:namew], GREY)
+    s.put(x, y, name[:namew], ch(GREY))
     if isinstance(val, str):
         val = val[: max(0, w - namew - 1)]
     if frac is not None and w - namew - valw - 2 >= 3:
@@ -2374,9 +2381,9 @@ def vw_rows(s, x, y, w, n, rows, acc, keep_big=False):
             for i, t in enumerate(side):
                 if sx + lw + 4 > x + w:
                     break
-                s.put(sx, yy + i, t[0], c)
+                s.put(sx, yy + i, t[0], ch(c))
                 lx = sx + (2 if ic else 0)
-                s.put(lx, yy + i, t[1], GREY)
+                s.put(lx, yy + i, t[1], ch(GREY))
                 vw_runs(s, lx + lw + 2, yy + i, t[2], t[3] if len(t) > 3 else TEXT, x + w - lx - lw - 2)
             yy += L + 1
         elif isinstance(r, list):
@@ -3033,19 +3040,24 @@ RATE_UNITS = (("B/s", 1), ("KB/s", 1e3), ("MB/s", 1e6), ("GB/s", 1e9))
 def rate_unit(v):
     return next((i for i, (_, d) in enumerate(RATE_UNITS) if v / d < 1000), len(RATE_UNITS) - 1)
 
-def steady_unit(pn, v, hold=4):
-    """The readout's unit, which moves only after the value has wanted another unit (past
+def steady_unit(pn, v, key="nunit", hold=4):
+    """A rate's display unit, which moves only after the value has wanted another unit (past
     1000 of this one, or under 1) for `hold` seconds; meanwhile the digits clamp at 999.9."""
     want, now = rate_unit(v), time.time()
-    cur, since = pn.__dict__.get("nunit", (None, None))
+    cur, since = pn.__dict__.get(key, (None, None))
     if cur is None or want == cur:
         since = None
     elif since is None:
         since = now
     elif now - since >= hold:
         cur, since = want, None
-    pn.nunit = (want if cur is None else cur, since)
-    return pn.nunit[0]
+    pn.__dict__[key] = (want if cur is None else cur, since)
+    return pn.__dict__[key][0]
+
+def steady_rate(pn, v, key):
+    """A smoothed rate at a fixed width: always "ddd.d unit", in its steady unit."""
+    u = steady_unit(pn, v, key)
+    return f"{min(v / RATE_UNITS[u][1], 999.9):5.1f} {RATE_UNITS[u][0]:<4}"
 
 def rate(v, u=None):
     """Bytes/s as text in its own (or the given) unit: 12.3 KB/s."""
@@ -3081,22 +3093,24 @@ def view_network(s, st, cfg, pn):
     ts = tailscale(pn)
     q = (w or {}).get("q")
     icon = chr(WIFI_GLYPHS[min(3, q // 25)]) if NERD and q is not None else (IC["net"] if w else "")
-    # the readout: smoothed, in a unit that holds still, always "ddd.d" so its width never moves
-    u = steady_unit(pn, sd)
-    big = f"{min(sd / RATE_UNITS[u][1], 999.9):5.1f}".replace(" ", "_")
-
+    # the readout is the Wi-Fi signal on the strip's 0-100, the mean of the last three samples
+    # so it does not flicker; the rates sit beside it, smoothed and at a fixed width
+    dq = th_hist(pn, "v:q", q) if q is not None else None
+    sig = round(sum(list(dq)[-3:]) / len(list(dq)[-3:])) if dq else None
+    down_t, up_t = steady_rate(pn, sd, "nu_down"), steady_rate(pn, su, "nu_up")
     side = []
     if w and w.get("SSID"):
         side.append((icon, "wifi", w["SSID"]))
-        if q is not None:
-            side.append(("", "signal", f"{w['dbm']} dBm · {q}", charge_c(q, 100)))
-        side.append(("", "link", " · ".join(x for x in (w.get("band"), w.get("rx bitrate") or w.get("tx bitrate")) if x)))
+        side.append(("", "link", " · ".join(x for x in (f"{w['dbm']} dBm" if q is not None else None, w.get("band"),
+                                                        w.get("rx bitrate") or w.get("tx bitrate")) if x)))
     else:
-        side.append((icon, "link", f"{iface or 'none'}" + (" · wifi not connected" if w else "")))
-    side.append(("", "ipv4", ip or "--"))
-    side.append(("", "up", rate(su)))
-    rows = [{"big": big, "unit": RATE_UNITS[u][0].ljust(4), "c": LIME, "side": side,
-             "row": ("down", None, f"{rate(sd)}  up {rate(su)}", None, LIME)}]
+        side.append((icon, "wifi", "no wifi", GREY))
+        side.append(("", "link", iface or "none"))
+    side += [("", "down", down_t), ("", "up", up_t), ("", "ipv4", ip or "--")]
+    sc = charge_c(sig, 100) if sig is not None else GREY
+    rows = [{"big": digits(sig, 3) if sig is not None else "_--", "unit": "%", "c": LIME, "side": side,
+             "row": [("signal", (sig or 0) / 100, f"{sig}%" if sig is not None else "no wifi", sc, sc),
+                     ("down", None, f"{down_t.strip()}   up {up_t.strip()}")]}]   # the fallback keeps the rates
     top_ = max(max(drx), max(dtx), 1024)
     hero = {"color": LIME, "rows": rows, "rw": 56, "across": True, "grow": 1,
             "graphs": [(drx, 0, top_, f"down {rate(down)}", LIME), (dtx, 0, top_, f"up {rate(up)}", LIME)]}
@@ -3128,10 +3142,13 @@ def draw_view(s, st, cfg, pn, name):
      "power": view_power, "network": view_network, "thermal": draw_thermal}[name](s, st, cfg, pn)
 
 def main():
+    global CHROME
     ap = argparse.ArgumentParser(description="one-page hardware dashboard for a terminal or Linux console")
     ap.add_argument("--config", default=os.path.expanduser("~/.config/hwdeck/config.toml"))
     ap.add_argument("--interval", type=float, default=None, help="seconds between refreshes (default 2)")
     ap.add_argument("--once", action="store_true", help="draw one frame and exit (for testing)")
+    ap.add_argument("--no-orbit", action="store_true",
+                    help="views: no burn-in protection (pixel orbit and dimmed chrome); also orbit = false in the config")
     ap.add_argument("--style", choices=["bunker", "btop", "eq", "panel", "glance", "thermal"],
                     help="btop: btop-like boxes (default); bunker: heavy chassis of meters; eq: equalizer bars; panel: control-room lamps; glance: big numerals; thermal: every temperature sensor and fan, by zone. eq/panel need 120x46")
     ap.add_argument("--view", choices=VIEWS,
@@ -3146,6 +3163,13 @@ def main():
         with open(args.config, "rb") as f:
             cfg = tomllib.load(f)
     interval = args.interval or cfg.get("interval", 2.0)
+    # Burn-in protection for the views, which stay up for hours with static frames and labels:
+    # the drawing orbits one cell through (0,0) (1,0) (1,1) (0,1) every ORBIT seconds inside a
+    # spare column and row, and after DIM seconds the chrome drops a step (live values do not).
+    orbit = not args.no_orbit and cfg.get("orbit", True)
+    orbit_s = float(os.environ.get("HWDECK_ORBIT_SECONDS") or 180)
+    dim_s = float(os.environ.get("HWDECK_DIM_SECONDS") or 1800)
+    started = time.time()
     svc_cfg = cfg.get("services", {})
     extra_cmds = cfg.get("extra", {}).get("commands", [])
 
@@ -3205,7 +3229,16 @@ def main():
                      "cpu_freq": freq, "gpu": g, "mem": mem, "temps": temps, "fans": fans, "net": (iface, rx, tx),
                      "disks": mounts(), "io": io_rate, "services": services, "extra": extra, "interval": interval}
             if style in VIEWS and w >= 50 and h >= 10:      # views fit themselves to a small terminal
-                draw_view(s, state, cfg, pn, style)
+                up = time.time() - started
+                CHROME = 0.65 if orbit and up >= dim_s else 1.0
+                if orbit:                                     # one offset for the whole frame
+                    ox, oy = ((0, 0), (1, 0), (1, 1), (0, 1))[int(up // orbit_s) % 4]
+                    v = Screen(w - 1, h - 1, BLACK)
+                    draw_view(v, state, cfg, pn, style)
+                    for y, row in enumerate(v.cells):
+                        s.cells[y + oy][ox: ox + w - 1] = row
+                else:
+                    draw_view(s, state, cfg, pn, style)
             elif w < 100 or h < 40:
                 s.put(0, 0, f"hwdeck needs at least 100x40, this terminal is {w}x{h}", "Y")
             elif style == "btop" and w >= 128 and h >= 46:
