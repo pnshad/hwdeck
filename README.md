@@ -32,7 +32,7 @@ On screen every meter and graph is coloured. The full frames are in
 
 ## Styles
 
-The same data, five ways to draw it. Pick one with `--style` or `style = "..."` in the config.
+The same data, five ways to draw it, plus a sixth that shows only heat and air. Pick one with `--style` or `style = "..."` in the config.
 
 | Style | What it looks like |
 |---|---|
@@ -41,9 +41,12 @@ The same data, five ways to draw it. Pick one with `--style` or `style = "..."` 
 | **`eq`** | Groups of equalizer bars with falling peak-hold caps, like an old media player's spectrum analyzer. |
 | **`panel`** | A plant control panel: annunciator lamps that light by level, LED ladders and bracketed readouts. |
 | **`glance`** | Three big numerals with load strips and heat tiles, for reading from across a room. |
+| **`thermal`** | Every temperature sensor and every fan, one btop-style box per zone (CPU, fans, battery, board, skin & air, storage) with gradient meters and a history graph each. Channels that read nothing are listed raw in a "no sensor" strip. |
 
 `btop`, `bunker`, `eq` and `panel` are laid out for 128×48 (a 1024×768 console with the
-8×16 font); `glance` works from 100×40. A smaller terminal falls back to `glance`.
+8×16 font); `glance` works from 100×40. A smaller terminal falls back to `glance`. `thermal` fits itself to
+any size from 50×14: more columns on a wide screen, then it drops the summary box and trims
+rows on a short one.
 
 ## What it reads
 
@@ -53,12 +56,19 @@ The same data, five ways to draw it. Pick one with `--style` or `style = "..."` 
 | GPU | AMD via amdgpu sysfs (busy, VRAM, power and cap, temperatures, fan and PWM, core and memory clocks, core voltage) or NVIDIA via `nvidia-smi` |
 | Memory, disks | used / available / cached / swap, per-mount usage, read and write rates |
 | Network | per-interface bytes and packets per second |
-| Temperatures | every hwmon channel: CPU package and cores, GPU, NVMe, DIMMs, board inputs, chipset, Wi-Fi, NIC |
-| Cooling | every fan header's rpm, PWM duty and control mode |
+| Temperatures | every hwmon channel: CPU package and cores, GPU, NVMe, DIMMs, board inputs, chipset, Wi-Fi, NIC; on Intel Macs every applesmc key (CPU, battery, memory, PCH, heatpipes, palm rest, airflow, ambient, Thunderbolt, SSD) |
+| Cooling | every fan header's rpm, PWM duty and control mode; applesmc fans with min, max and target rpm |
 | Power | every voltage rail the board reports, GPU power history |
 | Services | systemd units you list, shown as green or red |
 
-Channels that read nothing (unwired board inputs) are left out. Alarm thresholds come from
+Channels that read nothing (unwired board inputs) are left out.
+
+The `thermal` style reads every hwmon chip straight from `/sys/class/hwmon` (no lm-sensors
+needed), including `applesmc` on Intel Macs, whose files sit on the platform device. Each
+4-character SMC key gets a friendly name and a zone, with the raw key kept beside it; names
+marked `?` are community guesses for that key. Readings of -127, -44, -0.25 or 0 are absent
+sensors and are listed as "no sensor". Fans show rpm, % of max, min / max, the SMC target and
+auto or manual mode. Alarm thresholds come from
 the sensor's own critical value where it reports one.
 
 ## Run it
@@ -73,7 +83,7 @@ Ctrl-C to quit. For fan speeds, voltages and board temperatures install lm-senso
 (`sudo apt install lm-sensors`, then `sudo sensors-detect`); some boards need a driver
 module, for example `nct6775`.
 
-Options: `--style NAME`, `--config FILE` (default `~/.config/hwdeck/config.toml`),
+Options: `--style NAME` (`btop`, `bunker`, `eq`, `panel`, `glance`, `thermal`), `--config FILE` (default `~/.config/hwdeck/config.toml`),
 `--interval SECONDS`, `--once` (draw one frame and exit). Every setting is optional; see
 [`config.example.toml`](config.example.toml).
 

@@ -7,7 +7,7 @@ laptop): 16 colours and CP437 glyphs only, so it renders on a plain VT with the 
 kernel font. Pure Python 3 standard library; reads /proc and /sys, no root needed.
 `sensors -j` (lm-sensors) and `nvidia-smi` are used when present.
 
-Usage:  hwdeck [--config FILE] [--interval SECONDS] [--once]
+Usage:  hwdeck [--style btop|bunker|eq|panel|glance|thermal] [--config FILE] [--interval SECONDS] [--once]
 """
 import argparse, json, os, re, shutil, socket, subprocess, sys, time
 from collections import deque
@@ -1879,13 +1879,288 @@ def draw_btop(s, st, cfg, pn):
         e = ascii_only(st["extra"][0])
         s.put(w - len(e) - 3, h - 1, f"┤{e}├", "y")
 
+# ================================================================ thermal ====
+# Every temperature channel and every fan on the machine, in the btop design language,
+# one box per zone. Made for Apple laptops running Linux, where applesmc exposes ~40
+# 4-character SMC keys: each key gets a friendly name and a zone, and the raw key stays
+# visible next to it. Any other machine still gets every hwmon channel, zoned by chip.
+
+# SMC key -> (zone, friendly name, guess). Names follow the community key lists
+# (iStat, smcFanControl, the Linux applesmc threads); guess=True marks the ones nobody
+# documents for this board, drawn with a dim "?" after the key.
+SMC = {
+    "TC0P": ("cpu", "CPU proximity", False),
+    "TC0E": ("cpu", "CPU die, PECI filtered", True),    # (guess) virtual die temp
+    "TC0F": ("cpu", "CPU die, fan control", True),      # (guess) die temp the fan loop uses
+    "TC1C": ("cpu", "CPU core 1", False),
+    "TC2C": ("cpu", "CPU core 2", False),
+    "TC3C": ("cpu", "CPU core 3", False),
+    "TC4C": ("cpu", "CPU core 4", False),
+    "TCXC": ("cpu", "CPU cores, PECI", False),
+    "TCGC": ("cpu", "graphics, PECI", False),
+    "TCSA": ("cpu", "system agent, PECI", False),
+    "TCMX": ("cpu", "CPU max", True),                   # (guess) hottest of the CPU keys
+    "TCMc": ("cpu", "CPU max core", True),              # (guess) reads 0 now and then on MacBookPro14,2
+    "TCTD": ("cpu", "CPU throttle diode", True),        # (guess) reads -0.25 on MacBookPro14,2
+    "TB0T": ("battery", "battery max", False),          # TS_MAX: hottest cell sensor
+    "TB1T": ("battery", "battery 1", False),
+    "TB2T": ("battery", "battery 2", False),
+    "TBXT": ("battery", "battery, combined", True),     # (guess)
+    "TM0P": ("board", "memory proximity", False),
+    "TPCD": ("board", "PCH die", False),
+    "Th1H": ("board", "heatpipe 1", False),
+    "Th2H": ("board", "heatpipe 2", False),
+    "TTLD": ("board", "Thunderbolt left", False),
+    "TTRD": ("board", "Thunderbolt right", False),
+    "TW0P": ("board", "Wi-Fi proximity", False),
+    "Ts0P": ("skin", "palm rest 1", False),
+    "Ts1P": ("skin", "palm rest 2", False),
+    "Ts0S": ("skin", "skin 1", True),                   # (guess) bottom case near the palm rest
+    "Ts1S": ("skin", "skin 2", True),                   # (guess)
+    "TSDV": ("skin", "skin, virtual", True),            # (guess) reads -127 on MacBookPro14,2
+    "TSDO": ("skin", "skin, offset", True),             # (guess) reads 0 on MacBookPro14,2
+    "TaLC": ("skin", "airflow left", False),
+    "TaRC": ("skin", "airflow right", False),
+    "TA0V": ("skin", "ambient", False),
+    "TH0A": ("storage", "SSD A", True),                 # (guess) the TH0* family is the SSD
+    "TH0a": ("storage", "SSD A, raw", True),            # (guess) lower case = unfiltered
+    "TH0B": ("storage", "SSD B", True),                 # (guess)
+    "TH0b": ("storage", "SSD B, raw", True),            # (guess)
+    "TH0C": ("storage", "SSD C", True),                 # (guess)
+    "TH0c": ("storage", "SSD C, raw", True),            # (guess)
+    "TH0F": ("storage", "SSD flash", True),             # (guess) reads -44 on MacBookPro14,2
+    "TH0R": ("storage", "SSD controller", True),        # (guess) reads -44 on MacBookPro14,2
+    "TH0x": ("storage", "SSD max", True),               # (guess) reads -127 on MacBookPro14,2
+}
+# zone -> (title, box colour, ceiling °C where the meter is full and the reading turns red)
+ZONES = {"cpu": ("cpu", "g", 100), "fans": ("fans", "b", 0), "battery": ("battery", "y", 60),
+         "board": ("board", "c", 95), "skin": ("skin & air", "m", 50), "storage": ("storage", "C", 80),
+         "other": ("other", "w", 100)}
+CHIP_ZONE = {"coretemp": "cpu", "k10temp": "cpu", "zenpower": "cpu", "nvme": "storage", "drivetemp": "storage",
+             "BAT": "battery", "amdgpu": "board", "iwlwifi": "board", "pch": "board", "acpitz": "board"}
+
+def no_sensor(v):
+    """applesmc reports absent sensors as -127, -44.25, -0.25 or 0."""
+    return v is None or v <= 1.0 or v >= 130
+
+def thermal_channels():
+    """[(zone, name, key, guess, °C or None, ceiling)] and [(label, key, rpm, min, max, target, manual)]
+    for every hwmon chip, read straight from sysfs. applesmc keeps its files on the platform
+    device rather than in the hwmon directory, so a hwmon with no channels falls back to device/."""
+    temps, fans = [], []
+    root = "/sys/class/hwmon"
+    for hw in sorted(os.listdir(root), key=lambda x: (len(x), x)) if os.path.isdir(root) else []:
+        base = f"{root}/{hw}"
+        files = os.listdir(base)
+        if not any(re.fullmatch(r"(temp|fan)\d+_input", f) for f in files) and os.path.isdir(base + "/device"):
+            base = os.path.realpath(base + "/device")
+            files = os.listdir(base)
+        chip = read(f"{root}/{hw}/name") or read(base + "/name") or hw
+        smc = chip == "applesmc"
+        zone = next((z for p, z in CHIP_ZONE.items() if chip.startswith(p)), "other")
+        for f in sorted(files, key=lambda x: (len(x), x)):
+            m = re.fullmatch(r"(temp|fan)(\d+)_input", f)
+            if not m:
+                continue
+            ch = f"{m.group(1)}{m.group(2)}"
+            raw = read(f"{base}/{f}")
+            v = int(raw) if raw and raw.lstrip("-").isdigit() else None
+            lab = (read(f"{base}/{ch}_label") or "").strip()
+            if m.group(1) == "fan":
+                num = {k: read(f"{base}/{ch}_{k}") for k in ("min", "max", "output", "manual")}
+                num = {k: int(x) if x and x.isdigit() else None for k, x in num.items()}
+                fans.append((lab or ch, ch, v or 0, num["min"], num["max"], num["output"], num["manual"]))
+                continue
+            t = v / 1000 if v is not None else None
+            crit = read(f"{base}/{ch}_crit") or read(f"{base}/{ch}_max")
+            crit = int(crit) / 1000 if crit and crit.isdigit() and 40_000 < int(crit) < 130_000 else None
+            if smc:
+                z, name, guess = SMC.get(lab, ("other", lab or ch, True))
+                temps.append((z, name, lab or ch, guess, t, ZONES[z][2]))
+            else:
+                name = lab.replace("Package id 0", "CPU package").replace("Composite", "NVMe composite")
+                name = re.sub(r"^Core (\d+)", r"core \1", name) or f"{chip} {ch}"
+                if chip.startswith("BAT"):
+                    name = f"{chip} pack"
+                temps.append((zone, name, ch, False, t, crit or ZONES[zone][2]))
+    return temps, fans
+
+def th_hist(pn, key, v):
+    d = pn.hist.setdefault(key, deque(maxlen=HIST))
+    d.append(v)
+    return d
+
+def th_pack(boxes, ncols):
+    """Greedy pack of [zone, natural height] into the shortest column, in zone order."""
+    cols = [[] for _ in range(ncols)]
+    for z, nat in boxes:
+        min(cols, key=lambda c: sum(n for _, n in c)).append([z, nat])
+    return cols
+
+def th_layout(boxes, ncols, avail):
+    """Stretch each column to fill `avail` rows (spare rows go to the graphs), or trim rows
+    off its tallest box when short; a box that still does not fit is dropped and returned."""
+    cols, dropped = th_pack(boxes, ncols), []
+    for c in cols:
+        while c and sum(n for _, n in c) > avail and max(n for _, n in c) > 3:
+            max(c, key=lambda b: b[1])[1] -= 1
+        while c and sum(n for _, n in c) > avail:
+            dropped.append(c.pop()[0])
+        spare = avail - sum(n for _, n in c)
+        for i, b in enumerate(c):
+            b[1] += spare // len(c) + (1 if i < spare % len(c) else 0)
+    return cols, dropped
+
+def th_rows(s, x, y, w, n, rows):
+    """Sensor rows: friendly name, raw key, gradient meter, value. Returns rows drawn."""
+    namew = min(22, max(12, w - 30))
+    meterw = max(4, w - namew - 15)
+    shown = rows if len(rows) <= n else rows[: n - 1]
+    for i, (name, key, guess, t, ceil) in enumerate(shown):
+        f = (t - 20) / (ceil - 20)
+        s.put(x, y + i, ascii_only(name)[:namew].ljust(namew), "w")
+        s.put(x + namew + 1, y + i, key[:5].ljust(5), "K")
+        if guess:
+            s.put(x + namew + 1 + min(len(key), 5), y + i, "?", "K")
+        bt_meter(s, x + namew + 8, y + i, meterw, f)
+        s.put(x + w - 6, y + i, f"{t:4.0f}°C", bt_grad(f))
+    if len(rows) > n:
+        s.put(x, y + n - 1, f"+{len(rows) - n + 1} more", "K")
+    return len(shown)
+
+def draw_thermal(s, st, cfg, pn):
+    w, h = s.w, s.h
+    pn.tick += 1
+    temps, fans = thermal_channels()
+    if not temps and not fans:
+        s.put(0, 0, "hwdeck thermal: this machine has no hwmon temperature or fan channels", "Y")
+        return
+    hide = cfg.get("hide_sensors", [])
+    temps = [t for t in temps if not any(re.search(p, f"{t[1]} {t[2]}", re.I) for p in hide)]
+    live = [t for t in temps if not no_sensor(t[4])]
+    dead = [t for t in temps if no_sensor(t[4])]
+    zones = {}
+    for z, name, key, guess, t, ceil in live:
+        zones.setdefault(z, []).append((name, key, guess, t, ceil))
+    order = [z for z in ZONES if z in zones or (z == "fans" and fans)]
+    for z in order:                                      # one history per zone: its hottest reading
+        if z == "fans":
+            th_hist(pn, "th:fans", max((r / mx * 100 for _, _, r, _, mx, _, _ in fans if mx), default=0))
+        else:
+            th_hist(pn, f"th:{z}", max(r[3] for r in zones[z]))
+
+    # the no-sensor footer: raw readings, wrapped; one line on a short terminal
+    words = [f"{t[2]} {t[4]:g}" if t[4] is not None else f"{t[2]} --" for t in dead]
+    lines, cur = [], ""
+    for wd in words:
+        if cur and len(cur) + 3 + len(wd) > w - 10:
+            lines.append(cur)
+            cur = ""
+        cur = f"{cur}   {wd}" if cur else wd
+    if cur:
+        lines.append(cur)
+    keep = 1 if h < 30 else max(1, h // 12)
+    if len(lines) > keep:
+        rest = sum(ln.count("   ") + 1 for ln in lines[keep:])
+        lines = lines[:keep]
+        lines[-1] += f"   +{rest}"
+    fh = len(lines) + 2 if dead else 0
+
+    # fewest columns that show every row (2 on a wide screen, 3 on a very wide one);
+    # on a short terminal drop the summary box first, then trim rows
+    nat = [(z, 2 + (2 * len(fans) if z == "fans" else len(zones[z]))) for z in order]
+    maxc = max(1, min(3, w // 40, len(order)))
+    minc = min(maxc, 1 if w < 124 else (2 if w < 270 else 3))
+    fit = lambda n, a: max(sum(b[1] for b in c) for c in th_pack(nat, n)) <= a
+    top, ncols = 0, maxc
+    for top_ in ((3, 0) if h >= 24 else (0,)):
+        n = next((n for n in range(minc, maxc + 1) if fit(n, h - top_ - fh)), None)
+        if n:
+            top, ncols = top_, n
+            break
+    avail = h - top - fh
+    cols, dropped = th_layout(nat, ncols, avail)
+
+    # ================================================================ 0 thermal =====
+    hottest = max(live, key=lambda t: t[4], default=None)
+    if top:
+        bt_box(s, 0, 0, w, 3, 0, "thermal", BT["temp"], centre=time.strftime("%H:%M:%S"),
+               right=(cfg.get("title") or st["host"])[:20])
+        x = 2
+        for z in order:
+            if z == "fans":
+                txt, c = "fans " + "/".join(f"{r}" for _, _, r, _, _, _, _ in fans) + " rpm", "B"
+            else:
+                mz = max(zones[z], key=lambda r: r[3])
+                txt, c = f"{ZONES[z][0]} {mz[3]:.0f}°C", bt_grad((mz[3] - 20) / (mz[4] - 20))
+            if x + len(txt) > w - 30:
+                break
+            s.put(x, 1, txt, c)
+            x += len(txt) + 3
+        tail = f"{len(live)} live  {len(dead)} no sensor"
+        if hottest and x < w - len(tail) - 24:
+            tail = f"hottest {hottest[2]} {hottest[4]:.0f}°C  " + tail
+        if x < w - len(tail) - 2:
+            s.put(w - len(tail) - 2, 1, tail, "w")
+
+    # =============================================================== no sensor =====
+    if fh:
+        note = f"{len(dropped)} zones need a taller terminal" if dropped else "raw readings, hidden"
+        bt_box(s, 0, h - fh, w, fh, "", "no sensor", BT["sys"], right=note)
+        for i, ln in enumerate(lines):
+            s.put(2, h - fh + 1 + i, ln[: w - 4], "K")
+
+    # ================================================================ zone boxes ====
+    colw = [w // ncols + (1 if i < w % ncols else 0) for i in range(ncols)]
+    num = {z: i + 1 for i, z in enumerate(order)}
+    for ci, col in enumerate(cols):
+        x, y, bw = sum(colw[:ci]), top, colw[ci]
+        for z, bh in col:
+            title, color, _ = ZONES[z]
+            inner = bh - 2
+            rw = min(bw - 4, 64)
+            side = bw - 4 - rw >= 20                    # graph beside the rows, else under them
+            rw = rw if side else bw - 4
+            gx, gw = (x + rw + 5, bw - rw - 7) if side else (x + 2, bw - 4)
+            if z == "fans":
+                spin = sum(1 for f in fans if f[2] > 0)
+                bt_box(s, x, y, bw, bh, num[z], title, color, right=f"{spin}/{len(fans)} spinning")
+                for i, (lab, key, rpm, lo, mx, tgt, man) in enumerate(fans[: max(1, inner // 2)]):
+                    yy = y + 1 + i * 2
+                    f = rpm / mx if mx else 0
+                    namew = max(6, min(14, rw - 30))
+                    s.put(x + 2, yy, ascii_only(lab)[:namew].ljust(namew), "w")
+                    s.put(x + 3 + namew, yy, key[:5].ljust(5), "K")
+                    bt_meter(s, x + 9 + namew, yy, max(4, rw - namew - 24), f, None)
+                    s.put(x + 2 + rw - 15, yy, f"{rpm:5d} rpm {f * 100:3.0f}%", "W")
+                    if inner >= 2 * (i + 1):
+                        mode = "manual" if man else "auto"
+                        s.put(x + 4 + namew, yy + 1, f"min {lo or 0}  max {mx or 0}  target {tgt if tgt is not None else '--'}  {mode}"[: rw - namew - 2], "K")
+                lo_g, hi_g = 0, 100
+            else:
+                rows = sorted(zones[z], key=lambda r: not r[1].startswith("temp"))   # hwmon chips first, then SMC
+                mz = max(rows, key=lambda r: r[3])
+                bt_box(s, x, y, bw, bh, num[z], title, color, right=f"max {mz[3]:.0f}°C  {len(rows)}")
+                th_rows(s, x + 2, y + 1, rw, inner, rows)
+                lo_g, hi_g = 20, max(r[4] for r in rows)
+            used = (min(len(fans), inner // 2) * 2) if z == "fans" else min(len(zones[z]), inner)
+            gy, gh = (y + 1, inner) if side else (y + 2 + used, inner - used - 1)
+            if gw >= 14 and gh >= (2 if side else 3):
+                d = pn.hist[f"th:{z}"]
+                bt_graph(s, gx, gy, gw, gh, d, lo_g, hi_g)
+                lab_ = f"{d[-1]:.0f}%" if z == "fans" else f"{d[-1]:.0f}°C"
+                s.put(gx, gy, lab_, "W")
+                span = len(d) * st.get("interval", 2.0)
+                s.put(gx + gw - 8, gy, f"{span / 60:4.1f}min"[-8:], "K")
+            y += bh
+
 def main():
     ap = argparse.ArgumentParser(description="one-page hardware dashboard for a terminal or Linux console")
     ap.add_argument("--config", default=os.path.expanduser("~/.config/hwdeck/config.toml"))
     ap.add_argument("--interval", type=float, default=None, help="seconds between refreshes (default 2)")
     ap.add_argument("--once", action="store_true", help="draw one frame and exit (for testing)")
-    ap.add_argument("--style", choices=["bunker", "btop", "eq", "panel", "glance"],
-                    help="btop: btop-like boxes (default); bunker: heavy chassis of meters; eq: equalizer bars; panel: control-room lamps; glance: big numerals. eq/panel need 120x46")
+    ap.add_argument("--style", choices=["bunker", "btop", "eq", "panel", "glance", "thermal"],
+                    help="btop: btop-like boxes (default); bunker: heavy chassis of meters; eq: equalizer bars; panel: control-room lamps; glance: big numerals; thermal: every temperature sensor and fan, by zone. eq/panel need 120x46")
     ap.add_argument("--version", action="version", version=f"hwdeck {VERSION}")
     args = ap.parse_args()
 
@@ -1944,8 +2219,10 @@ def main():
                      "load": os.getloadavg(), "cpu_model": cpu.model, "gpu_name": gpu.name, "gpu_kind": gpu.kind,
                      "kernel": f"{os.uname().sysname} {os.uname().release}", "cpu": total, "cores": cores,
                      "cpu_freq": freq, "gpu": g, "mem": mem, "temps": temps, "fans": fans, "net": (iface, rx, tx),
-                     "disks": mounts(), "io": io_rate, "services": services, "extra": extra}
-            if w < 100 or h < 40:
+                     "disks": mounts(), "io": io_rate, "services": services, "extra": extra, "interval": interval}
+            if style == "thermal" and w >= 50 and h >= 14:   # scales itself down to a small terminal
+                draw_thermal(s, state, cfg, pn)
+            elif w < 100 or h < 40:
                 s.put(0, 0, f"hwdeck needs at least 100x40, this terminal is {w}x{h}", "Y")
             elif style == "btop" and w >= 128 and h >= 46:
                 draw_btop(s, state, cfg, pn)
