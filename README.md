@@ -59,15 +59,17 @@ hwdeck --view memory     # used / available / cached / buffers / swap, and the t
 hwdeck --view fans       # every fan: rpm, % of max, target, min / max, mode, the CPU temperature it follows
 hwdeck --view battery    # charge, health, power in and out, the charge limit, battery temperatures
 hwdeck --view power      # what the machine draws: battery watts, RAPL domains, AC, who uses the CPU
+hwdeck --view network    # Wi-Fi SSID, band, signal and link rate, IPv4, live down / up, Tailscale
 hwdeck --view thermal    # every temperature sensor and fan by zone (the same as --style thermal)
 ```
 
 The views are drawn in the visual language of the Touch Bar strip rather than btop's: a pure
 black screen, one accent colour per subject (CPU mint, fans cyan, memory violet, power yellow,
-temperatures cyan warming through amber to red, battery red at empty, yellow at half, green at
+network lime, temperatures cyan warming through amber to red, battery red at empty, yellow at half, green at
 the charge limit), grey labels, and one rounded frame in the accent. Under its top edge sits
 the hero: the main number as a 7-segment LED readout (lit segments in the accent, unlit ones
-faintly visible), its facts beside it, its rows and the history graph. Sections follow in
+faintly visible; the same size in every view, five rows, the unit on its bottom row), its
+facts beside it, its rows and the history graph. Sections follow in
 columns, each with its own heading and graph where one says something. Headings and the main
 facts carry a Nerd Font icon.
 
@@ -80,21 +82,22 @@ foot's padding matches, and gives it back on exit.
 |---|---|
 | **`cpu`** | Total load as the LED readout with cores, clock, package temperature, load average and throttle state beside it; per-core load, clock and core temperature; the user / system / iowait / irq split; load history. `temp`: coretemp plus the CPU SMC keys, with the hottest one's history. `throttle`: thermal-throttle event counts and time since boot (core and package), headroom to the CPU's critical temperature, ACPI passive cooling steps, the TCC offset, idle injection, package watts (RAPL, root-only on most kernels). `clock`: average clock against the maximum with its history, turbo, the scaling cap, governor and energy preference, intel_pstate perf limits, min / max / base, driver. |
 | **`memory`** | Used share as the readout; used, available, cached, buffers, free, shared and swap meters. `top`: resident memory per program name, summed over its processes, from `/proc/*/statm`. `swap`: every swap device and zram's compression ratio, with history. `cache`: page cache, buffers, reclaimable slab, active / inactive file pages, dirty and writeback, with history. |
-| **`fans`** | One section per fan, side by side: rpm in small LED digits, % of max, the SMC target, min and max, auto or manual mode, the CPU temperature the fan loop is answering to, and an rpm history. |
+| **`fans`** | One section per fan, side by side: rpm as the LED readout, % of max, the SMC target, min and max, auto or manual mode, the CPU temperature the fan loop is answering to, and an rpm history. |
 | **`battery`** | Charge as `charge_now / charge_full` (the kernel's `capacity` divides by the design capacity, which on a worn pack reads low; it is shown beside it), status, time to full or empty, the charge limit, the AC adapter, and a charge history. `power`: watts in or out, current, voltage, with a watts history. `health`: `charge_full` against `charge_full_design`, cycle count, chemistry and model. `temp`: the battery's hwmon sensor and the SMC keys `TB0T`, `TB1T`, `TB2T`, `TBXT`, with history. |
 | **`power`** | The battery's watts as the readout (`current_now` x `voltage_now`; on battery that is the whole system's draw), its history, the power source and charge. `rapl`: every RAPL domain (package, cores, uncore / GPU, DRAM) in watts; where `energy_uj` is root-only it says "not readable yet" and lights up once it is readable. `top`: CPU share per program since the last frame, from `/proc/*/stat`, as a cheap stand-in for who is drawing the power. `ac`: the adapter, current and voltage. |
+| **`network`** | Download rate as the readout, with the Wi-Fi SSID, signal (dBm and the strip's 0-100, `2 x (dBm + 100)`), band and link rate, the IPv4 address and the upload rate beside it, and small down / up graphs side by side. Wi-Fi comes from `iw dev <if> link` (no root), else `/proc/net/wireless` and `nmcli -t`; the interface is the default route's (or `net_interface` in the config). On a taller window: `wifi` (channel, frequency, rx / tx rates), `ip` (address, gateway) and `tailscale` (state, address, peers online, exit node, from `tailscale status --json` at most every 15 s; the frame shows its state too). |
 | **`thermal`** | The hottest sensor as the readout with the fans and sensor count beside it, then one section per zone (CPU, fans, battery, board, skin & air, storage) with a meter per sensor in its temperature colour, and the channels that read nothing in a "no sensor" strip. |
 
 The charge limit is read from `charge_control_end_threshold`, on the battery or, on Intel
 Macs, on the `applesmc` platform device. Batteries that report energy (`energy_now`,
 `power_now`) work the same as those that report charge.
 
-The views are laid out for a 3 x 2 grid of equal windows on one laptop screen, about 66 x 27
-each, and use the space they get: the readout grows with the room, cores and meters pair up
-on a short window, sections pack into two columns, and thermal fits all its sensors (33 on a
-MacBook Pro 14,2) in two columns at that size. They fit any size from 50 x 14: on a short
-screen the readout gives way to a plain row, long lists end in "+N more" and the last
-sections drop. Graphs fill in as hwdeck runs; a `--once` frame has one sample.
+The views are laid out for a grid of windows on one laptop screen, about 66 x 27 each, with
+fans and network sharing one cell at about 66 x 12, and use the space they get: cores and
+meters pair up on a short window, sections pack into two columns, and thermal fits all its
+sensors (33 on a MacBook Pro 14,2) in two columns at that size. They fit any size from
+50 x 10: on a short screen the readout gives way to a plain row, long lists end in "+N more"
+and the last sections drop. Graphs fill in as hwdeck runs; a `--once` frame has one sample.
 
 ## What it reads
 
@@ -132,7 +135,7 @@ Ctrl-C to quit. For fan speeds, voltages and board temperatures install lm-senso
 module, for example `nct6775`.
 
 Options: `--style NAME` (`btop`, `bunker`, `eq`, `panel`, `glance`, `thermal`), `--view NAME`
-(`cpu`, `memory`, `fans`, `battery`, `power`, `thermal`; wins over `--style`), `--config FILE` (default
+(`cpu`, `memory`, `fans`, `battery`, `power`, `network`, `thermal`; wins over `--style`), `--config FILE` (default
 `~/.config/hwdeck/config.toml`), `--interval SECONDS`, `--once` (draw one frame and exit). Every setting is optional; see
 [`config.example.toml`](config.example.toml).
 

@@ -7,7 +7,7 @@ laptop): 16 colours and CP437 glyphs only, so it renders on a plain VT with the 
 kernel font. Pure Python 3 standard library; reads /proc and /sys, no root needed.
 `sensors -j` (lm-sensors) and `nvidia-smi` are used when present.
 
-Usage:  hwdeck [--style btop|bunker|eq|panel|glance|thermal] [--view cpu|memory|fans|battery|power|thermal]
+Usage:  hwdeck [--style btop|bunker|eq|panel|glance|thermal] [--view cpu|memory|fans|battery|power|network|thermal]
         [--config FILE] [--interval SECONDS] [--once]
 """
 import argparse, json, os, re, shutil, socket, subprocess, sys, time
@@ -2186,7 +2186,7 @@ def draw_thermal(s, st, cfg, pn):
             break
     bs, ncols = choice or (secs + ([no_sensor_box((iw - 3 * (maxc - 1)) // maxc)] if dead else []), maxc)
     hero["min"] = hmin
-    vw_layout(s, st, (IC["temp"], "thermal", acc, cfg.get("title") or st["host"]), hero, bs, ncols)
+    vw_layout(s, st, (IC["temp"], "thermal", acc, ascii_only(cfg.get("title") or st["host"])), hero, bs, ncols)
 
 # ================================================================== views ====
 # One thing per screen, full size, for a tap on the Touch Bar strip or a hotkey: --view cpu,
@@ -2206,10 +2206,11 @@ def draw_thermal(s, st, cfg, pn):
 #    "row": fallback}                                   fallback row or rows (or nothing) when short
 #   "text"                                              a dim note;  None = blank line
 
-VIEWS = ("cpu", "memory", "fans", "battery", "power", "thermal")
+VIEWS = ("cpu", "memory", "fans", "battery", "power", "network", "thermal")
 NERD = os.environ.get("TERM") != "linux"                 # the kernel console has no Nerd Font
 IC = {k: chr(v) if NERD else "" for k, v in (("cpu", 0xF061A), ("temp", 0xF050F), ("fan", 0xF0210),
-                                             ("mem", 0xF035B), ("plug", 0xF06A5), ("bat", 0xF0079))}
+                                             ("mem", 0xF035B), ("plug", 0xF06A5), ("bat", 0xF0079),
+                                             ("net", 0xF0928))}
 BAT_GLYPHS = (0xF008E, 0xF007A, 0xF007B, 0xF007C, 0xF007D, 0xF007E, 0xF007F, 0xF0080, 0xF0081, 0xF0082, 0xF0079)
 
 def level(v, cool, warm, hot, base):
@@ -2229,6 +2230,7 @@ def charge_c(pct, limit=None):
         return mix(RED, VOLT, pct / 50)
     return mix(VOLT, GREEN, (pct - 50) / max(1, (limit or 100) - 50))
 
+SEG_L = 3            # every view's readout: 5 rows, 5 columns a digit, the unit on its bottom row
 SEG7 = {"0": "abcdef", "1": "bc", "2": "abdeg", "3": "abcdg", "4": "bcfg", "5": "acdfg", "6": "acdefg",
         "7": "abc", "8": "abcdefg", "9": "abcdfg", "-": "g", "_": ""}
 
@@ -2276,7 +2278,7 @@ def vw_frame(s, icon, title, c, right):
     s.put(0, h - 1, "╰" + "─" * (w - 2) + "╯", edge)
     head = f" {icon} {title} " if icon else f" {title} "
     s.put(2, 0, head, c)
-    note = f" {ascii_only(right)} "[: max(0, w - len(head) - 8)] if right else ""
+    note = f" {right} "[: max(0, w - len(head) - 8)] if right else ""
     rx = w - 3 - len(note)
     if len(note) > 3:
         s.put(rx, 0, note, GREY)
@@ -2326,7 +2328,7 @@ def vw_rows(s, x, y, w, n, rows, acc, keep_big=False):
     when it does not fit (keep_big: unless only the rows under it would be cut), and rows past
     the bottom collapse into "+N more"."""
     big = lambda r: isinstance(r, dict)
-    if (vw_lines(rows) > n and not (keep_big and n >= 8)) or any(big(r) and seg7_w(r["big"], r.get("L", 3), r.get("unit", "")) > w for r in rows):
+    if (vw_lines(rows) > n and not (keep_big and n >= SEG_L + 4)) or any(big(r) and seg7_w(r["big"], r.get("L", 3), r.get("unit", "")) > w for r in rows):
         rows = [x for r in rows for x in (r.get("row") if big(r) and isinstance(r.get("row"), list) else
                                           [r.get("row") if big(r) else r])]   # "row" may be a list of rows
         rows = [r for i, r in enumerate(rows) if r is not None or 0 < i < len(rows) - 1]
@@ -2373,23 +2375,31 @@ def vw_rows(s, x, y, w, n, rows, acc, keep_big=False):
         yy += 1
     return yy - y
 
-def vw_graphs(s, x, y, w, h, graphs, st, acc):
-    """Stacked history graphs, each labelled with its value and the time it spans; one colour
-    deepening toward the top, or a function of height for a level gradient (temperatures,
-    charge). A faint floor under each, so an empty graph still reads as one."""
-    n = min(len(graphs), h // 3 or h // 2)              # two rows still make a label over a strip
+def vw_graphs(s, x, y, w, h, graphs, st, acc, across=False):
+    """History graphs, stacked (or side by side: across), each labelled with its value and the
+    time it spans; one colour deepening toward the top, or a function of height for a level
+    gradient (temperatures, charge). A faint floor under each, so an empty graph still reads
+    as one. Two rows make a label over a strip; one row is a bare sparkline."""
+    if across:
+        n = min(len(graphs), max(0, (w + 2) // 14))
+        gw = [(w - 2 * (n - 1)) // n + (1 if i < (w - 2 * (n - 1)) % n else 0) for i in range(n)] if n else []
+        boxes = [(x + sum(gw[:i]) + 2 * i, y, gw[i], h) for i in range(n)]
+    else:
+        n = min(len(graphs), h // 3 or h // 2 or h)
+        gh = [h // n + (1 if i < h % n else 0) for i in range(n)] if n else []
+        boxes = [(x, y + sum(gh[:i]), w, gh[i]) for i in range(n)]
     if n <= 0 or w < 12:
         return
-    gh = [h // n + (1 if i < h % n else 0) for i in range(n)]
-    for i, (d, lo, hi, lab, c) in enumerate(graphs[:n]):
-        gy = y + sum(gh[:i])
+    for (gx, gy, ww, hh), (d, lo, hi, lab, c) in zip(boxes, graphs):
         c = c or acc
         grad = c if callable(c) else (lambda f, c=c: mix(faint(c, 0.45), c, f))
-        s.put(x, gy + gh[i] - 1, "▁" * w, faint(grad(0), 0.35))
-        bt_graph(s, x, gy, w, gh[i], d, lo, hi, grad)
-        s.put(x, gy, lab[: w - 10], TEXT)
-        span = len(d) * st.get("interval", 2.0)
-        s.put(x + w - 8, gy, f"{span / 60:4.1f}min"[-8:], GREY)
+        s.put(gx, gy + hh - 1, "▁" * ww, faint(grad(0), 0.35))
+        bt_graph(s, gx, gy, ww, hh, d, lo, hi, grad)
+        if hh >= 2:
+            s.put(gx, gy, lab[: ww - 9], TEXT)
+            span = len(d) * st.get("interval", 2.0)
+            if ww - len(lab) >= 16:
+                s.put(gx + ww - 7, gy, f"{span / 60:4.1f}m"[-7:], GREY)
 
 def vw_nat(b, head=True):
     return (1 if head else 0) + (b.get("lines") or vw_lines(b.get("rows", [])))
@@ -2411,35 +2421,29 @@ def vw_box(s, x, y, w, h, b, st, head=True):
     draw_rows = b.get("fn") or (lambda s_, x_, y_, w_, n_: vw_rows(s_, x_, y_, w_, n_, b.get("rows", []), acc, b.get("keep_big")))
     used = draw_rows(s, x + w - rw, y, rw, h)
     if side:
-        vw_graphs(s, x, y, w - rw - 2, h, b["graphs"], st, acc)
-    elif h - used >= (2 if not head else 3):
+        vw_graphs(s, x, y, w - rw - 2, h, b["graphs"], st, acc, b.get("across"))
+    elif h - used >= (1 if b.get("spark") else 2 if not head else 3):
         gap = 1 if h - used >= 5 else 0
-        vw_graphs(s, x, y + used + gap, w, h - used - gap, b.get("graphs") or [], st, acc)
+        vw_graphs(s, x, y + used + gap, w, h - used - gap, b.get("graphs") or [], st, acc, b.get("across"))
 
 def vw_layout(s, st, top, hero, boxes, ncols):
     """One frame (top = icon, title, accent, note), the hero under its edge and sections in
-    columns under the hero. The biggest LED readout that leaves everything showing wins; then
-    spare rows go mostly to the hero's graph. Short screens drop the readout for its plain
-    row, trim rows and drop the last sections (each view lists them most important first)."""
+    columns under the hero; spare rows go mostly to the hero's graph. Short screens drop the
+    readout for its plain row, trim rows and drop the last sections (each view lists them
+    most important first)."""
     w, h = s.w, s.h
     vw_frame(s, *top)
     iw, ih, gap = w - 4, h - 2, 3
     ncols = max(1, min(ncols, len(boxes))) if boxes else 1
     colw = lambda n: [(iw - gap * (n - 1)) // n + (1 if i < (iw - gap * (n - 1)) % n else 0) for i in range(n)]
     cw = min(colw(ncols))
-    bigs = [(r, iw - (24 if r.get("side") else 0)) for r in (hero or {}).get("rows", []) if isinstance(r, dict)]
-    bigs += [(r, cw - (24 if r.get("side") else 0)) for b in boxes for r in b.get("rows", []) if isinstance(r, dict)]
+    bigs = [(r, iw) for r in (hero or {}).get("rows", []) if isinstance(r, dict)]
+    bigs += [(r, cw) for b in boxes for r in b.get("rows", []) if isinstance(r, dict)]
     hgraph = 0 if not hero or not hero.get("graphs") or vw_side(hero, iw) else 3
-
-    def need(L):
-        for r, _ in bigs:
-            r["L"] = min(L, r.get("Lmax", L))
-        hd = vw_nat(hero, False) + hgraph if hero else 0
-        dn = max((sum(n for _, n in c) for c in th_pack([(i, vw_nat(b)) for i, b in enumerate(boxes)], ncols)), default=0)
-        return hd, dn
-    fits = lambda L: all(seg7_w(r["big"], min(L, r.get("Lmax", L)), r.get("unit", "")) <= bw for r, bw in bigs)
-    L = next((L for L in (5, 4) if fits(L) and sum(need(L)) <= ih), 3)
-    hd, dnat = need(L)
+    for r, _ in bigs:
+        r["L"] = SEG_L
+    hd = vw_nat(hero, False) + hgraph if hero else 0
+    dnat = max((sum(n for _, n in c) for c in th_pack([(i, vw_nat(b)) for i, b in enumerate(boxes)], ncols)), default=0)
     hh = 0
     if hero:
         if not boxes:
@@ -2608,7 +2612,7 @@ def view_cpu(s, st, cfg, pn):
     boxes.append({"title": "clock", "color": MINT, "right": f"{favg:.2f} GHz", "rows": clk, "rw": 46,
                   "graphs": [(dclk, 0, fmax, f"{favg:.2f} GHz", MINT)]})
     # most important first: a short screen drops the last
-    vw_layout(s, st, (IC["cpu"], "cpu", MINT, st["cpu_model"]), hero, boxes,
+    vw_layout(s, st, (IC["cpu"], "cpu", MINT, ascii_only(st["cpu_model"])), hero, boxes,
               1 if s.w < 60 else (2 if s.w < 200 else 3))
 
 # --------------------------------------------------------------- memory ----
@@ -2711,19 +2715,23 @@ def view_fans(s, st, cfg, pn):
         f = rpm / top
         hf = (hot[3] - 20) / (hot[4] - 20) if hot else 0
         mode = ("manual", AMBER) if man else ("auto", GREEN)
-        big = {"big": digits(rpm, 4), "unit": "rpm", "c": ICE, "Lmax": 1,   # small LED digits, three rows
-               "row": ("rpm", f, f"{rpm} rpm", ICE, TEXT)}
+        big = {"big": digits(rpm, 4), "unit": "rpm", "c": ICE, "row": ("rpm", f, f"{rpm} rpm", ICE, TEXT)}
         if cw >= 48:                                     # room for the facts beside the readout
             big["side"] = [(IC["fan"], "speed", f"{f * 100:.0f}% of max"), ("", "target", f"{tgt} rpm" if tgt is not None else "--"),
                            ("", "mode", mode[0], mode[1])]
-        rows = [big, ("speed", f, f"{f * 100:3.0f}%", ICE),
-                ("target", (tgt or 0) / top, f"{tgt} rpm" if tgt is not None else "--", ICE),
-                ("min / max", None, f"{lo if lo is not None else '--'} / {mx or '--'} rpm"),
-                ("mode", None, mode[0], None, mode[1])]
+        follows = f"{hot[3]:.0f}°C" + ("" if hot[1].startswith("temp") else f" {hot[1]}") if hot else ""
+        if s.h < 20:                                     # half a grid cell: mode sits in the heading
+            rows = [big, ("speed", f, f"{f * 100:.0f}% tgt {tgt if tgt is not None else '--'}", ICE),
+                    ("min-max", None, f"{lo if lo is not None else '--'}-{mx or '--'} rpm")]
+        else:
+            rows = [big, ("speed", f, f"{f * 100:3.0f}%", ICE),
+                    ("target", (tgt or 0) / top, f"{tgt} rpm" if tgt is not None else "--", ICE),
+                    ("min / max", None, f"{lo if lo is not None else '--'} / {mx or '--'} rpm"),
+                    ("mode", None, mode[0], None, mode[1])]
         if hot:                                          # what the fan loop is answering to
-            rows.append(("cpu temp", hf, f"{hot[3]:.0f}°C" + ("" if hot[1].startswith("temp") else f" {hot[1]}"), temp_c(hf), temp_c(hf)))
+            rows.append(("cpu temp" if s.h >= 20 else "follows", hf, follows, temp_c(hf), temp_c(hf)))
         boxes.append({"title": ascii_only(lab).lower(), "icon": IC["fan"], "color": ICE, "rows": rows, "rw": 48,
-                      "keep_big": True, "right": f"{key} · {mode[0]}",
+                      "keep_big": True, "spark": True, "right": f"{key} · {mode[0]}",
                       "graphs": [(d, 0, top, f"{rpm} rpm  {f * 100:.0f}%", ICE)]})
     spin = sum(1 for f in fans if f[2] > 0)
     vw_layout(s, st, (IC["fan"], "fans", ICE, f"{spin}/{len(fans)} spinning"), None, boxes, ncols)
@@ -2829,7 +2837,7 @@ def view_battery(s, st, cfg, pn):
     tb = vw_temp_box(pn, vw_temps("battery"), "temp", "v:batt")
     if tb:
         boxes.append(tb)
-    vw_layout(s, st, (icon, "battery", acc, b["model"] or b["name"]), hero, boxes,
+    vw_layout(s, st, (icon, "battery", acc, ascii_only(b["model"] or b["name"])), hero, boxes,
               1 if s.w < 60 else (2 if s.w < 200 else 3))
 
 # ---------------------------------------------------------------- power ----
@@ -2920,9 +2928,149 @@ def view_power(s, st, cfg, pn):
     vw_layout(s, st, (IC["plug"] if ac else IC["bat"], "power", VOLT, way), hero, boxes,
               1 if s.w < 60 else (2 if s.w < 200 else 3))
 
+# -------------------------------------------------------------- network ----
+LIME = (0.62, 0.90, 0.32)                                # the strip's Wi-Fi green, kept apart from battery green
+WIFI_GLYPHS = (0xF091F, 0xF0922, 0xF0925, 0xF0928)       # 1 .. 4 bars, as the strip
+
+def default_route():
+    """(interface, gateway) of the IPv4 default route, from /proc/net/route."""
+    for line in (read("/proc/net/route", "") or "").splitlines()[1:]:
+        f = line.split()
+        if len(f) > 2 and f[1] == "00000000":
+            return f[0], ".".join(str(b) for b in bytes.fromhex(f[2])[::-1])
+    return None, None
+
+def wifi_info():
+    """The Wi-Fi link: interface, SSID, frequency, signal and bitrates. `iw dev <if> link`
+    needs no root; without iw, /proc/net/wireless gives the signal and nmcli the rest."""
+    base = "/sys/class/net"
+    ifs = [n for n in sorted(os.listdir(base)) if os.path.isdir(f"{base}/{n}/wireless")] if os.path.isdir(base) else []
+    if not ifs:
+        return None
+    w = {"if": ifs[0]}
+    for line in run("iw", "dev", ifs[0], "link", timeout=1).splitlines():
+        k, _, v = line.strip().partition(": ")
+        if k in ("SSID", "freq", "signal", "rx bitrate", "tx bitrate"):
+            w[k] = v
+    if "signal" not in w:
+        for line in (read("/proc/net/wireless", "") or "").splitlines()[2:]:
+            if line.split(":")[0].strip() == ifs[0] and len(line.split()) > 3:
+                w["signal"] = line.split()[3].rstrip(".")
+    if "SSID" not in w:
+        for line in run("nmcli", "-t", "-f", "ACTIVE,SSID,FREQ,RATE", "dev", "wifi", timeout=1).splitlines():
+            f = line.split(":")
+            if f[0] == "yes" and len(f) >= 4:
+                w.update({"SSID": f[1], "freq": f[2].split()[0], "tx bitrate": f[3]})
+                break
+    for k in ("rx bitrate", "tx bitrate"):                # "400.0 MBit/s VHT-MCS 9 ..." -> "400 Mb/s"
+        m = re.match(r"([\d.]+)", w.get(k, ""))
+        if m:
+            w[k] = f"{float(m.group(1)):g} Mb/s"
+    try:
+        w["dbm"] = int(float(w["signal"].split()[0]))
+        w["q"] = max(0, min(100, 2 * (w["dbm"] + 100)))  # the strip's 0-100
+    except (KeyError, ValueError, IndexError):
+        pass
+    try:
+        mhz = float(w["freq"])
+        w["band"] = "2.4 GHz" if mhz < 2500 else ("5 GHz" if mhz < 5925 else "6 GHz")
+        w["ch"] = round((mhz - (2407 if mhz < 2500 else 5000 if mhz < 5925 else 5950)) / 5)
+    except (KeyError, ValueError):
+        pass
+    return w
+
+def ipv4(iface):
+    m = re.search(r"inet (\S+)", run("ip", "-4", "-o", "addr", "show", "dev", iface, timeout=1)) if iface else None
+    return m.group(1) if m else None
+
+def tailscale(pn):
+    """`tailscale status --json` (no root; ~30 ms), at most every 15 s; None without tailscale."""
+    c = pn.__dict__.get("ts")
+    if c and time.time() - c[0] < 15:
+        return c[1]
+    try:
+        d = json.loads(run("tailscale", "status", "--json", timeout=1) or "null")
+    except ValueError:
+        d = None
+    out = None
+    if isinstance(d, dict):
+        peers = list((d.get("Peer") or {}).values())
+        out = {"state": d.get("BackendState") or "--", "ip": ((d.get("Self") or {}).get("TailscaleIPs") or ["--"])[0],
+               "peers": len(peers), "online": sum(1 for p in peers if p.get("Online")),
+               "exit": next((p.get("HostName") for p in peers if p.get("ExitNode")), None)}
+    pn.ts = (time.time(), out)
+    return out
+
+def net_rate(pn, iface):
+    """Bytes per second down and up on one interface since the last frame."""
+    nd, now = netdev(), time.time()
+    prev = pn.__dict__.get("netp")
+    pn.netp = (iface, nd.get(iface), now)
+    if prev and prev[0] == iface and prev[1] and iface in nd and now > prev[2]:
+        return tuple(max(0.0, (a - b) / (now - prev[2])) for a, b in zip(nd[iface], prev[1]))
+    return 0.0, 0.0
+
+def rate(v):
+    """Bytes/s as (digits for the LED readout, unit): 12.3 KB/s, 456 KB/s, 1.2 MB/s."""
+    for unit, div in (("B/s", 1), ("KB/s", 1e3), ("MB/s", 1e6), ("GB/s", 1e9)):
+        if v / div < 999.5:
+            break
+    x = v / div
+    return (f"{x:4.1f}" if x < 99.95 and unit != "B/s" else f"{x:4.0f}").replace(" ", "_"), unit
+
+def view_network(s, st, cfg, pn):
+    route, gw = default_route()
+    w = wifi_info()
+    iface = cfg.get("net_interface") or route or (w or {}).get("if")
+    down, up = net_rate(pn, iface)
+    drx, dtx = th_hist(pn, "v:rx", down), th_hist(pn, "v:tx", up)
+    ip = ipv4(iface)
+    ts = tailscale(pn)
+    q = (w or {}).get("q")
+    icon = chr(WIFI_GLYPHS[min(3, q // 25)]) if NERD and q is not None else (IC["net"] if w else "")
+    txt = lambda v: " ".join(x.strip("_") for x in rate(v)).replace("_", "")
+    d_, du = rate(down)
+
+    side = []
+    if w and w.get("SSID"):
+        side.append((icon, "wifi", w["SSID"]))
+        if q is not None:
+            side.append(("", "signal", f"{w['dbm']} dBm · {q}", charge_c(q, 100)))
+        side.append(("", "link", " · ".join(x for x in (w.get("band"), w.get("rx bitrate") or w.get("tx bitrate")) if x)))
+    else:
+        side.append((icon, "link", f"{iface or 'none'}" + (" · wifi not connected" if w else "")))
+    side.append(("", "ipv4", ip or "--"))
+    side.append(("", "up", txt(up)))
+    rows = [{"big": d_, "unit": du, "c": LIME, "side": side, "row": ("down", None, f"{txt(down)}  up {txt(up)}", None, LIME)}]
+    top_ = max(max(drx), max(dtx), 1024)
+    hero = {"color": LIME, "rows": rows, "rw": 56, "across": True,
+            "graphs": [(drx, 0, top_, f"down {txt(down)}", LIME), (dtx, 0, top_, f"up {txt(up)}", LIME)]}
+
+    boxes = []
+    if s.h >= 20:                                        # half a grid cell holds the hero alone
+        if w:
+            wr = [("ssid", None, w.get("SSID") or "not connected"), ("interface", None, w["if"])]
+            if q is not None:
+                wr.append(("signal", q / 100, f"{w['dbm']} dBm  {q}", charge_c(q, 100)))
+            if w.get("freq"):
+                wr.append(("band", None, f"{w.get('band', '')} ch {w.get('ch', '--')}  {float(w['freq']):.0f} MHz"))
+            for k in ("rx bitrate", "tx bitrate"):
+                if w.get(k):
+                    wr.append((k[:2] + " rate", None, w[k]))
+            boxes.append({"title": "wifi", "icon": icon, "color": LIME, "right": w.get("band", ""), "rows": wr})
+        boxes.append({"title": "ip", "color": LIME, "right": iface or "", "rows": [
+            ("ipv4", None, ip or "--"), ("gateway", None, gw or "--"), ("interface", None, iface or "--")]})
+        if ts:
+            boxes.append({"title": "tailscale", "color": LIME, "right": ts["state"].lower(), "rows": [
+                ("state", None, ts["state"], None, GREEN if ts["state"] == "Running" else AMBER),
+                ("address", None, ts["ip"]), ("peers", ts["online"] / max(1, ts["peers"]), f"{ts['online']}/{ts['peers']} online", LIME),
+                ("exit node", None, ts["exit"] or "none")]})
+    note = f"tailscale {ts['state'].lower()} · {ts['online']}/{ts['peers']} online" if ts else (iface or "")
+    vw_layout(s, st, (icon or IC["net"], "network", LIME, note), hero, boxes, 1 if s.w < 60 else (2 if s.w < 200 else 3))
+
 def draw_view(s, st, cfg, pn, name):
     {"cpu": view_cpu, "memory": view_memory, "fans": view_fans, "battery": view_battery,
-     "power": view_power, "thermal": draw_thermal}[name](s, st, cfg, pn)
+     "power": view_power, "network": view_network, "thermal": draw_thermal}[name](s, st, cfg, pn)
 
 def main():
     ap = argparse.ArgumentParser(description="one-page hardware dashboard for a terminal or Linux console")
@@ -2932,7 +3080,7 @@ def main():
     ap.add_argument("--style", choices=["bunker", "btop", "eq", "panel", "glance", "thermal"],
                     help="btop: btop-like boxes (default); bunker: heavy chassis of meters; eq: equalizer bars; panel: control-room lamps; glance: big numerals; thermal: every temperature sensor and fan, by zone. eq/panel need 120x46")
     ap.add_argument("--view", choices=VIEWS,
-                    help="one thing full screen instead of a style: cpu, memory, fans, battery, power, or thermal (the same as --style thermal)")
+                    help="one thing full screen instead of a style: cpu, memory, fans, battery, power, network, or thermal (the same as --style thermal)")
     ap.add_argument("--version", action="version", version=f"hwdeck {VERSION}")
     args = ap.parse_args()
 
@@ -2957,6 +3105,8 @@ def main():
     if style == "power":                                  # prime the RAPL and per-process deltas
         rapl_domains(pn)
         proc_cpu(pn, 0)
+    if style == "network":                                # and the interface's byte counters
+        net_rate(pn, cfg.get("net_interface") or default_route()[0] or (wifi_info() or {}).get("if"))
     # a view paints pure black; OSC 11 turns the terminal's own background (foot's padding) black
     # too, and OSC 111 gives it back on exit. The kernel console has no use for either.
     paint = style in VIEWS and NERD and not args.once
@@ -2999,7 +3149,7 @@ def main():
                      "kernel": f"{os.uname().sysname} {os.uname().release}", "cpu": total, "cores": cores,
                      "cpu_freq": freq, "gpu": g, "mem": mem, "temps": temps, "fans": fans, "net": (iface, rx, tx),
                      "disks": mounts(), "io": io_rate, "services": services, "extra": extra, "interval": interval}
-            if style in VIEWS and w >= 50 and h >= 14:      # views fit themselves to a small terminal
+            if style in VIEWS and w >= 50 and h >= 10:      # views fit themselves to a small terminal
                 draw_view(s, state, cfg, pn, style)
             elif w < 100 or h < 40:
                 s.put(0, 0, f"hwdeck needs at least 100x40, this terminal is {w}x{h}", "Y")
