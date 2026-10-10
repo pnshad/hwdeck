@@ -10,7 +10,7 @@ kernel font. Pure Python 3 standard library; reads /proc and /sys, no root neede
 Usage:  hwdeck [--style btop|bunker|eq|panel|glance|thermal] [--view cpu|memory|fans|battery|power|network|thermal]
         [--config FILE] [--interval SECONDS] [--once]
 """
-import argparse, json, os, re, shutil, socket, subprocess, sys, time
+import argparse, itertools, json, os, re, shutil, socket, subprocess, sys, time
 from collections import deque
 
 try:
@@ -2037,7 +2037,17 @@ def th_hist(pn, key, v):
     return d
 
 def th_pack(boxes, ncols):
-    """Greedy pack of [zone, natural height] into the shortest column, in zone order."""
+    """Pack [zone, natural height] into ncols columns, each column keeping the boxes' order:
+    the split with the shortest tallest column and no empty column, tried exhaustively while
+    that is cheap (a few thousand splits), else greedily into the shortest column."""
+    if 1 < ncols and ncols ** len(boxes) <= 6561:
+        def cost(pick):
+            h = [0] * ncols
+            for (_, nat), c in zip(boxes, pick):
+                h[c] += nat
+            return max(h), h.count(0)
+        pick = min(itertools.product(range(ncols), repeat=len(boxes)), key=lambda p: cost(p)[::-1])
+        return [[[z, nat] for (z, nat), c in zip(boxes, pick) if c == ci] for ci in range(ncols)]
     cols = [[] for _ in range(ncols)]
     for z, nat in boxes:
         min(cols, key=lambda c: sum(n for _, n in c)).append([z, nat])
@@ -2127,7 +2137,7 @@ def draw_thermal(s, st, cfg, pn):
     zones = {}
     for z, name, key, guess, t, ceil in live:
         zones.setdefault(z, []).append((name, key, guess, t, ceil))
-    order = [z for z in ZONES if z in zones or (z == "fans" and fans)]
+    order = [z for z in ZONES if z in zones and z != "fans"] + (["fans"] if fans else [])
     for z in order:                                      # one history per zone: its hottest reading
         if z == "fans":
             th_hist(pn, "th:fans", max((r / mx * 100 for _, _, r, _, mx, _, _ in fans if mx), default=0))
@@ -2137,20 +2147,24 @@ def draw_thermal(s, st, cfg, pn):
     fol = fan_follows(zones.get("cpu", []))
     hf = (hot[4] - 20) / (hot[5] - 20) if hot else 0
     dh = th_hist(pn, "th:hot", hot[4] if hot else 0)
-    acc = temp_c(hf)
+    ht = round(hot[4]) if hot else None
+    acc = level(ht, 50, 72, 90, ICE) if hot else GREY     # the strip's 50 / 72 / 90 °C, absolute
 
-    # the hottest sensor as the LED readout; the zones' maxima sit in their section headings
+    # the hottest sensor as the LED readout, whole °C; beside it what it is, the counts and the
+    # fans (each with the temperature its loop follows); zones' maxima sit in their headings
     spin = sum(1 for f in fans if f[2] > 0)
-    side = [(IC["temp"], "hottest", ascii_only(hot[1]) if hot else "--"),
-            ("", "sensor", f"{hot[2]} in {ZONES[hot[0]][0]}" if hot else "--")]
-    if fans:
+    side = [(IC["temp"], "hottest", f"{ascii_only(hot[1])} {hot[2]}" if hot else "--"),
+            ("", "sensors", f"{len(live)} live · {len(dead)} no sensor")]
+    fanline = lambda f: f"{f[2]} rpm {f[2] / f[4] * 100 if f[4] else 0:.0f}%" + (f" · {fol[3]:.0f}°C" if fol else "")
+    if len(fans) <= 3:
+        side += [(IC["fan"] if i == 0 else "", ascii_only(f[0]).split()[0].lower()[:7], fanline(f)) for i, f in enumerate(fans)]
+    else:
         side.append((IC["fan"], "fans", " · ".join(str(f[2]) for f in fans) + " rpm"))
-    side.append(("", "sensors", f"{len(live)} live · {len(dead)} no sensor"))
     hero = {"color": acc, "rw": 56,
-            "rows": [{"big": f"{hot[4] if hot else 0:3.0f}".replace(" ", "_"), "unit": "°C", "c": acc, "side": side,
-                      "row": [("hottest", hf, f"{ascii_only(hot[1]) if hot else '--'}  {hot[4] if hot else 0:.0f}°C", acc, acc),
+            "rows": [{"big": digits(ht, 3) if hot else "_--", "unit": "°C", "c": acc, "side": side,
+                      "row": [("hottest", hf, f"{ascii_only(hot[1]) if hot else '--'}  {ht if hot else '--'}°C", acc, acc),
                               f"{len(live)} live · {len(dead)} no sensor" + (f" · fans {' '.join(str(f[2]) for f in fans)} rpm" if fans else "")]}],
-            "graphs": [(dh, 20, hot[5] if hot else 100, f"{hot[4] if hot else 0:.0f}°C  hottest", temp_c)]}
+            "graphs": [(dh, 20, hot[5] if hot else 100, f"{ht if hot else '--'}°C  hottest", temp_c)]}
 
     secs = []
     for z in order:
@@ -2163,7 +2177,7 @@ def draw_thermal(s, st, cfg, pn):
         mz = max(rows, key=lambda r: r[3])
         ceil = max(r[4] for r in rows)
         secs.append({"title": ZONES[z][0], "icon": IC["temp"], "color": temp_c((mz[3] - 20) / (mz[4] - 20)),
-                     "right": f"max {mz[3]:.0f}°C · {len(rows)}", "lines": len(rows), "rw": 64,
+                     "right": f"max {mz[3]:.0f}° · {len(rows)}", "lines": len(rows), "rw": 64,
                      "fn": lambda s_, x, y, w, n, rows=rows: th_rows(s_, x, y, w, n, rows),
                      "graphs": [(pn.hist[f"th:{z}"], 20, ceil, f"{mz[3]:.0f}°C  {ascii_only(mz[0])}", temp_c)]})
 
@@ -2185,27 +2199,29 @@ def draw_thermal(s, st, cfg, pn):
             lines[-1] += f"   +{rest}"
         return {"title": "no sensor", "color": GREY, "right": "raw readings", "rows": lines}
 
-    # fewest columns that show every row under the smallest hero (2 on a wide screen, 3 on a
-    # very wide one); a fan gives up its detail row before a sensor row is cut
+    # fewest columns that show every sensor row under the readout (2 on a wide screen, 3 on a
+    # very wide one). What gives way first, in order: a fan's detail row, the no-sensor strip,
+    # the fans section (its rpm and % stay beside the readout); a sensor row only last of all
     iw, ih = s.w - 4, s.h - 2
-    hmin = 6 if ih >= 40 else 1
+    hmin = SEG_L + 2 if ih >= 18 else 1                 # keep the readout from 20 rows up
     maxc = max(1, min(3, s.w // 32, len(secs)))       # two sensor columns from 64 wide
     minc = min(maxc, 1 if s.w < 124 else (2 if s.w < 270 else 3))
     fit = lambda bs, n: max(sum(b[1] for b in c) for c in th_pack(bs, n)) <= ih - hmin
+    temp_secs = [b for b in secs if b["title"] != "fans"]
+    fan_sec = [b for b in secs if b["title"] == "fans"]
     choice = None
-    for per in (2, 1):
+    for per, with_ns, with_fans in ((2, 1, 1), (1, 1, 1), (1, 0, 1), (1, 0, 0)):
         for n in range(minc, maxc + 1):
             cw = (iw - 3 * (n - 1)) // n
-            bs = secs + ([no_sensor_box(cw)] if dead else [])
-            for b in bs:
-                if b["title"] == "fans":
-                    b["lines"] = per * len(fans)
+            bs = temp_secs + (fan_sec if with_fans else []) + ([no_sensor_box(cw)] if dead and with_ns else [])
+            for b in fan_sec:
+                b["lines"] = per * len(fans)
             if fit([(i, vw_nat(b)) for i, b in enumerate(bs)], n):
                 choice = (bs, n)
                 break
         if choice:
             break
-    bs, ncols = choice or (secs + ([no_sensor_box((iw - 3 * (maxc - 1)) // maxc)] if dead else []), maxc)
+    bs, ncols = choice or (temp_secs, maxc)
     hero["min"] = hmin
     vw_layout(s, st, (IC["temp"], "thermal", acc, ascii_only(cfg.get("title") or st["host"])), hero, bs, ncols)
 
