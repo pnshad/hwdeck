@@ -2290,35 +2290,32 @@ SEG7 = {"0": "abcdef", "1": "bc", "2": "abdeg", "3": "abcdg", "4": "bcfg", "5": 
         "7": "abc", "8": "abcdefg", "9": "abcdfg", "-": "g", "_": ""}
 
 def seg7_w(text, L, unit=""):
-    return sum(2 if ch == "." else L + 3 for ch in text) - 1 + (len(unit) + 1 if unit else 0)
+    return sum(2 if ch == "." else 6 for ch in text) - 1 + (len(unit) + 1 if unit else 0)
+
+GRID = {"0": ("###", "#.#", "#.#", "#.#", "###"), "1": (".#.", "##.", ".#.", ".#.", "###"),
+        "2": ("###", "..#", "###", "#..", "###"), "3": ("###", "..#", ".##", "..#", "###"),
+        "4": ("#.#", "#.#", "###", "..#", "..#"), "5": ("###", "#..", "###", "..#", "###"),
+        "6": ("###", "#..", "###", "#.#", "###"), "7": ("###", "..#", "..#", "..#", "..#"),
+        "8": ("###", "#.#", "###", "#.#", "###"), "9": ("###", "#.#", "###", "..#", "###"),
+        "-": ("...", "...", "###", "...", "..."), "_": ("...",) * 5}
 
 def seg7(s, x, y, text, c, L=3):
-    """Digits as a 7-segment LED readout, like the strip's clock: lit segments in `c`, unlit
-    ones faintly visible. A digit is (L+2) x (2L+3) square pixels, two to a cell with half
-    blocks, so it stands L+2 rows. "_" is a digit with nothing lit, "." a lit dot. Returns
-    the width drawn."""
-    H, px, cx = 2 * L + 3, {}, 0
-    for ch in text:
-        if ch == ".":
-            px[cx, H - 1] = c
+    """The readout: digits as 3 x 5 squares, like a heatmap's cells, lit in `c`; the unlit
+    squares stay faintly visible, as the faded 8s of an LCD. A square is the top half of a
+    cell (one column by half a row: square in the terminal font), with a column and half a
+    row between squares, so a digit is 5 columns by 5 rows and a space. "_" is a digit with
+    nothing lit, "." a lit square on the bottom row. Returns the width drawn. (L is kept for
+    callers.)"""
+    cx, off = 0, faint(c, 0.16)
+    for ch_ in text:
+        if ch_ == ".":
+            s.put(x + cx, y + 4, "\u2580", c)
             cx += 2
             continue
-        lit = SEG7.get(ch, "")
-        span = range(1, L + 1)
-        segs = {"a": [(i, 0) for i in span], "g": [(i, L + 1) for i in span], "d": [(i, H - 1) for i in span],
-                "f": [(0, j) for j in span], "b": [(L + 1, j) for j in span],
-                "e": [(0, j + L + 1) for j in span], "c": [(L + 1, j + L + 1) for j in span]}
-        for name, pts in segs.items():
-            for p in pts:
-                px[cx + p[0], p[1]] = c if name in lit else faint(c, 0.16)
-        cx += L + 3
-    for col in range(cx):
-        for row in range(L + 2):
-            top, bot = px.get((col, 2 * row)), px.get((col, 2 * row + 1))
-            if top and bot:
-                s.put(x + col, y + row, "█" if top == bot else "▀", top, None if top == bot else bot)
-            elif top or bot:
-                s.put(x + col, y + row, "▀" if top else "▄", top or bot)
+        for r, line in enumerate(GRID.get(ch_, GRID["_"])):
+            for k, bit in enumerate(line):
+                s.put(x + cx + 2 * k, y + r, "\u2580", c if bit == "#" else off)
+        cx += 6
     return cx - 1
 
 def vw_frame(s, icon, title, c, right, clock=False):
