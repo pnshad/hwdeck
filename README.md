@@ -56,29 +56,45 @@ Pick one with `--view`; each is one flag:
 ```bash
 hwdeck --view cpu        # per-core load and clock, the CPU split, temperatures, throttling
 hwdeck --view memory     # used / available / cached / buffers / swap, and the top memory users
-hwdeck --view fans       # every fan, large
+hwdeck --view fans       # every fan: rpm, % of max, target, min / max, mode, the CPU temperature it follows
 hwdeck --view battery    # charge, health, power in and out, the charge limit, battery temperatures
+hwdeck --view power      # what the machine draws: battery watts, RAPL domains, AC, who uses the CPU
 hwdeck --view thermal    # every temperature sensor and fan by zone (the same as --style thermal)
 ```
 
-Every view is drawn in the `btop` design language: a full-width box on top with a big
-numeral, its rows and the big history graph, then detail boxes in columns under it, each
-with its own graph where one says something.
+The views are drawn in the visual language of the Touch Bar strip rather than btop's: a pure
+black screen, one accent colour per subject (CPU mint, fans cyan, memory violet, power yellow,
+temperatures cyan warming through amber to red, battery red at empty, yellow at half, green at
+the charge limit), grey labels, and one rounded frame in the accent. Under its top edge sits
+the hero: the main number as a 7-segment LED readout (lit segments in the accent, unlit ones
+faintly visible), its facts beside it, its rows and the history graph. Sections follow in
+columns, each with its own heading and graph where one says something. Headings and the main
+facts carry a Nerd Font icon.
+
+They want a terminal with 256 colours and a Nerd Font, and use 24-bit colour when
+`COLORTERM=truecolor` (foot sets it); on the kernel console (`TERM=linux`) the icons are left
+out. Outside `--once` a view also turns the terminal's own background black (OSC 11), so
+foot's padding matches, and gives it back on exit.
 
 | View | What it shows |
 |---|---|
-| **`cpu`** | Total load as a big numeral and graph; per-core load, clock and core temperature; user / system / iowait / irq split and load average. `temp`: coretemp plus the CPU SMC keys, with the hottest one's history. `throttle`: thermal-throttle event counts and time since boot (core and package), ACPI passive cooling steps, the TCC offset, idle injection, headroom to the CPU's critical temperature, package watts (RAPL, root-only on most kernels). `clock`: average clock against the maximum with its history, min / max / base, the scaling cap, governor and energy preference, driver, turbo, intel_pstate perf limits. |
-| **`memory`** | Used share as a big numeral and graph; used, available, cached, buffers, free, shared and swap meters. `swap`: every swap device and zram's compression ratio, with history. `top`: resident memory per program name, summed over its processes, from `/proc/*/statm`. `cache`: page cache, buffers, reclaimable slab, active / inactive file pages, dirty and writeback, with history. |
-| **`fans`** | One box per fan: rpm in big numerals, % of max, the SMC target, min and max, auto or manual mode, the CPU temperature the fan loop is answering to, and an rpm history. |
+| **`cpu`** | Total load as the LED readout with cores, clock, package temperature, load average and throttle state beside it; per-core load, clock and core temperature; the user / system / iowait / irq split; load history. `temp`: coretemp plus the CPU SMC keys, with the hottest one's history. `throttle`: thermal-throttle event counts and time since boot (core and package), headroom to the CPU's critical temperature, ACPI passive cooling steps, the TCC offset, idle injection, package watts (RAPL, root-only on most kernels). `clock`: average clock against the maximum with its history, turbo, the scaling cap, governor and energy preference, intel_pstate perf limits, min / max / base, driver. |
+| **`memory`** | Used share as the readout; used, available, cached, buffers, free, shared and swap meters. `top`: resident memory per program name, summed over its processes, from `/proc/*/statm`. `swap`: every swap device and zram's compression ratio, with history. `cache`: page cache, buffers, reclaimable slab, active / inactive file pages, dirty and writeback, with history. |
+| **`fans`** | One section per fan, side by side: rpm in small LED digits, % of max, the SMC target, min and max, auto or manual mode, the CPU temperature the fan loop is answering to, and an rpm history. |
 | **`battery`** | Charge as `charge_now / charge_full` (the kernel's `capacity` divides by the design capacity, which on a worn pack reads low; it is shown beside it), status, time to full or empty, the charge limit, the AC adapter, and a charge history. `power`: watts in or out, current, voltage, with a watts history. `health`: `charge_full` against `charge_full_design`, cycle count, chemistry and model. `temp`: the battery's hwmon sensor and the SMC keys `TB0T`, `TB1T`, `TB2T`, `TBXT`, with history. |
+| **`power`** | The battery's watts as the readout (`current_now` x `voltage_now`; on battery that is the whole system's draw), its history, the power source and charge. `rapl`: every RAPL domain (package, cores, uncore / GPU, DRAM) in watts; where `energy_uj` is root-only it says "not readable yet" and lights up once it is readable. `top`: CPU share per program since the last frame, from `/proc/*/stat`, as a cheap stand-in for who is drawing the power. `ac`: the adapter, current and voltage. |
+| **`thermal`** | The hottest sensor as the readout with the fans and sensor count beside it, then one section per zone (CPU, fans, battery, board, skin & air, storage) with a meter per sensor in its temperature colour, and the channels that read nothing in a "no sensor" strip. |
 
 The charge limit is read from `charge_control_end_threshold`, on the battery or, on Intel
 Macs, on the `applesmc` platform device. Batteries that report energy (`energy_now`,
 `power_now`) work the same as those that report charge.
 
-Views fit themselves to any size from 50×14. On a short screen the big numerals give way to
-a plain row, the last detail boxes are dropped and long lists end in "+N more". Graphs fill
-in as hwdeck runs; a `--once` frame has one sample.
+The views are laid out for a 3 x 2 grid of equal windows on one laptop screen, about 66 x 27
+each, and use the space they get: the readout grows with the room, cores and meters pair up
+on a short window, sections pack into two columns, and thermal fits all its sensors (33 on a
+MacBook Pro 14,2) in two columns at that size. They fit any size from 50 x 14: on a short
+screen the readout gives way to a plain row, long lists end in "+N more" and the last
+sections drop. Graphs fill in as hwdeck runs; a `--once` frame has one sample.
 
 ## What it reads
 
@@ -116,7 +132,7 @@ Ctrl-C to quit. For fan speeds, voltages and board temperatures install lm-senso
 module, for example `nct6775`.
 
 Options: `--style NAME` (`btop`, `bunker`, `eq`, `panel`, `glance`, `thermal`), `--view NAME`
-(`cpu`, `memory`, `fans`, `battery`, `thermal`; wins over `--style`), `--config FILE` (default
+(`cpu`, `memory`, `fans`, `battery`, `power`, `thermal`; wins over `--style`), `--config FILE` (default
 `~/.config/hwdeck/config.toml`), `--interval SECONDS`, `--once` (draw one frame and exit). Every setting is optional; see
 [`config.example.toml`](config.example.toml).
 
@@ -144,12 +160,14 @@ On a bare Linux console, `setterm -blank 0` keeps the screen on, and
 
 ## Notes
 
-- **No braille, no truecolour.** btop's braille graphs are beautiful, but most console fonts
-  don't have braille. Half-block graphs give two levels per cell and render everywhere.
+- **No braille.** btop's braille graphs are beautiful, but most console fonts don't have
+  braille. Half-block graphs give two levels per cell and render everywhere. The styles keep
+  to 16 colours; only the views use 256 or 24-bit colour and Nerd Font icons.
 - **Read-only by design.** hwdeck only reads `/proc`, `/sys`, `sensors` and `systemctl
   is-active`, plus any `[extra]` commands you add to your own config.
-- **Hardware, not programs**, with one exception: the `memory` view lists the programs using
-  the most memory, two small reads per process each refresh.
+- **Hardware, not programs**, with two exceptions: the `memory` view lists the programs using
+  the most memory (two small reads per process each refresh) and the `power` view the ones
+  using the most CPU (one read per process).
 - **CPU package power** comes from the RAPL counter, which most kernels only let root read;
   without it that reading is left out.
 
