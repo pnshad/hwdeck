@@ -70,23 +70,27 @@ segments white, unlit ones faintly visible; the same size in every view, five ro
 on its bottom row), its facts beside it, its rows and the history graph. Sections follow in
 columns, each with its own heading and graph where one says something.
 
-Colour is kept for two things. **Identity:** each view's title icon wears its subject's
-accent (CPU mint, thermal and fans cyan, network lime, memory violet, power yellow, battery
-green), and nothing else does. **Attention:** a value turns amber or red only when it crosses
+Colour is kept for two things. **Identity:** each view's subject accent (CPU mint, thermal
+and fans cyan, network lime, memory violet, power yellow, battery green) wears its title
+icon at full strength, and at a calm, slightly desaturated strength the readout's unit, the
+icons beside its facts and in section headings (the heading text stays grey), and the one
+meter or graph that tells the view's story: cpu's load history, the hottest sensor's meter,
+network's down / up graphs, memory's "used" meter, power's system-watts graph, battery's
+charge meter and charge history. The digits stay white. **Attention:** a value turns amber or red only when it crosses
 a threshold, on its text and its meter, never a whole section:
 
 | View | Amber | Red |
 |---|---|---|
-| thermal, fans | a temperature at 72 °C | at 90 °C |
-| cpu | load above 85 % for 30 s (the readout) | a throttle event since boot |
-| power | draw above 30 W for 30 s (the readout) | |
+| thermal, fans | a temperature at 72 °C; a battery sensor at 45 °C; a skin, palm-rest or airflow sensor at 45 °C | at 90 °C; battery at 55 °C; skin at 50 °C |
+| cpu | load above 85 % for 60 s (the readout) | a throttle event since boot |
+| power | draw above 38 W for 30 s (the readout) | |
 | battery | 20 % or less, or empty within the hour | 10 % or less |
 | memory | pressure (PSI some avg10) at 10 %, swap over 64 MB in use | PSI full avg10 at 5 % |
-| network | signal under 40 %, failed transmissions climbing over the last minute | signal at 20 % |
+| network | signal under 40 %, more than 5 failed transmissions in the last minute | signal at 20 % |
 
 The cpu `throttle` section's cooling steps (ACPI passive, TCC offset, idle injection) show
-amber while a step is active. In normal operation a view shows one coloured element: its
-icon.
+amber while a step is active. A warning overrides the accent: the readout's unit takes the
+warning's colour with the digits.
 
 Together the views make a wall (cpu, thermal, network, memory, power and battery side by
 side), and each fact lives on exactly one of them: temperatures and fans in thermal, watts

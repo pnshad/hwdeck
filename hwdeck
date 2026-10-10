@@ -2067,7 +2067,7 @@ def th_layout(boxes, ncols, avail):
             b[1] += spare // len(c) + (1 if i < spare % len(c) else 0)
     return cols, dropped
 
-def th_rows(s, x, y, w, n, rows):
+def th_rows(s, x, y, w, n, rows, hot_key=None, ac=None):
     """Sensor rows: friendly name, the raw key where there is room, a meter and the value,
     both in the temperature colour. Returns rows drawn."""
     kw = 7 if w >= 44 else 0
@@ -2080,8 +2080,9 @@ def th_rows(s, x, y, w, n, rows):
         if kw:
             s.put(x + namew + 1, y + i, key[:5] + ("?" if guess else ""), ch(faint(GREY, 0.6)))
         if meterw >= 3:
-            vw_meter(s, x + namew + 1 + kw, y + i, meterw, f, temp_w(t))
-        s.put(x + w - 5, y + i, f"{t:3.0f}°C", temp_w(t))
+            mc = temp_w(t, ceil)
+            vw_meter(s, x + namew + 1 + kw, y + i, meterw, f, ac if ac and (name, key) == hot_key and mc == TEXT else mc)
+        s.put(x + w - 5, y + i, f"{t:3.0f}°C", temp_w(t, ceil))
     if len(rows) > n:
         s.put(x, y + n - 1, f"+{len(rows) - n + 1} more", GREY)
     return len(shown)
@@ -2106,7 +2107,7 @@ def th_fans(s, x, y, w, n, fans, fol=None):
             s.put(x + namew + 1, yy, key[:5], ch(faint(GREY, 0.6)))
         val = [(f"{rpm:5d} rpm {f * 100:3.0f}%", TEXT)]
         if per == 1 and fol:
-            val = [(f"{rpm:5d} {f * 100:3.0f}%", TEXT), (f" {fol[3]:3.0f}°", temp_w(fol[3]))]
+            val = [(f"{rpm:5d} {f * 100:3.0f}%", TEXT), (f" {fol[3]:3.0f}°", temp_w(fol[3], fol[4]))]
         vl = vw_len(val)
         if w - namew - kw - vl - 2 >= 3:
             vw_meter(s, x + namew + 1 + kw, yy, w - namew - kw - vl - 2, f, TEXT)
@@ -2116,7 +2117,7 @@ def th_fans(s, x, y, w, n, fans, fol=None):
             fx = x + namew + 1
             if fol:
                 t = f"follows {fol[3]:.0f}°C {fol[1]}  "
-                s.put(fx, yy + 1, t[:room], temp_w(fol[3]))
+                s.put(fx, yy + 1, t[:room], temp_w(fol[3], fol[4]))
                 fx, room = fx + len(t), room - len(t)
             rng = f"{lo or 0}-{mx or 0} rpm  {'manual' if man else 'auto'}"
             if len(rng) <= room or not fol:              # whole, or not at all
@@ -2147,7 +2148,7 @@ def draw_thermal(s, st, cfg, pn):
     hf = (hot[4] - 20) / (hot[5] - 20) if hot else 0
     dh = th_hist(pn, "th:hot", hot[4] if hot else 0)
     ht = round(hot[4]) if hot else None
-    acc = temp_w(ht) if hot else GREY                  # white; amber from 72 °C, red from 90
+    acc = temp_w(ht, hot[5]) if hot else GREY          # white until the sensor's limits
 
     # the hottest sensor as the LED readout, whole °C; beside it what it is, the counts and the
     # fans (each with the temperature its loop follows); zones' maxima sit in their headings
@@ -2177,7 +2178,7 @@ def draw_thermal(s, st, cfg, pn):
         ceil = max(r[4] for r in rows)
         secs.append({"title": ZONES[z][0], "icon": IC["temp"], "color": TEXT,
                      "right": f"max {mz[3]:.0f}° · {len(rows)}", "lines": len(rows), "rw": 64,
-                     "fn": lambda s_, x, y, w, n, rows=rows: th_rows(s_, x, y, w, n, rows),
+                     "fn": lambda s_, x, y, w, n, rows=rows: th_rows(s_, x, y, w, n, rows, (hot[1], hot[2]) if hot else None, soft(ICE)),
                      "graphs": [(pn.hist[f"th:{z}"], 20, ceil, f"{mz[3]:.0f}°C  {ascii_only(mz[0])}", TEXT)]})
 
     # the no-sensor strip: raw readings, wrapped to the column; one line on a short terminal
@@ -2258,9 +2259,20 @@ def warn(v, amber, red, low=False):
         return RED if v <= red else (AMBER if v <= amber else TEXT)
     return RED if v >= red else (AMBER if v >= amber else TEXT)
 
-def temp_w(t):
-    """A temperature's colour: white, amber from 72 °C, red from 90 °C (the strip's breaks)."""
+def temp_w(t, ceil=100):
+    """A temperature's colour: white until its kind's limits, then amber, then red. The kind
+    comes from the zone ceiling thermal_channels gives the sensor: skin and palm rest (50)
+    45 / 50 °C, battery (60) 45 / 55 °C, the CPU and the rest 72 / 90 °C (the strip's)."""
+    if ceil <= 50:
+        return warn(t, 45, 50)
+    if ceil <= 60:
+        return warn(t, 45, 55)
     return warn(t, 72, 90)
+
+def soft(c):
+    """A view's accent at a calm strength: a little desaturated toward its own grey."""
+    g = sum(c) / 3
+    return mix((g, g, g), c, 0.7)
 
 def sustained(d, secs, st):
     """The mean of a history over its last `secs` seconds (all of it if shorter)."""
@@ -2328,10 +2340,13 @@ def vw_frame(s, icon, title, c, right, clock=False):
     if clock and cx > 3 + len(head) and cx + len(clock) < rx:
         s.put(cx, 0, clock, ch(GREY))
 
-def vw_head(s, x, y, w, icon, title, c, right=""):
-    """A section heading: icon and title in its colour, a faint rule, a grey note."""
+def vw_head(s, x, y, w, icon, title, c, right="", ac=None):
+    """A section heading: its icon in the view's accent, the title in grey, a faint rule, a
+    grey note."""
     head = f"{icon} {title}" if icon else title
-    s.put(x, y, head[:w], ch(c))
+    s.put(x, y, head[:w], ch(GREY))
+    if icon:
+        s.put(x, y, icon, ch(ac or c))
     right = right[: max(0, w - len(head) - 6)]
     s.put(x + len(head) + 1, y, "─" * max(0, w - len(head) - 1 - (len(right) + 1 if right else 0)), ch(faint(c, 0.45)))
     if right:
@@ -2391,8 +2406,9 @@ def vw_rows(s, x, y, w, n, rows, acc, keep_big=False):
         elif big(r):
             L, c = r.get("L", 3), r["c"]
             bw = seg7(s, x, yy, r["big"], c, L)
+            ac = c if c != TEXT else r.get("ac", c)      # a warning colours the unit too
             if r.get("unit"):
-                s.put(x + bw + 1, yy + L + 1, r["unit"], c)
+                s.put(x + bw + 1, yy + L + 1, r["unit"], ac)
                 bw += len(r["unit"]) + 1
             side = r.get("side", [])[: L + 2]
             sx = x + bw + 4
@@ -2401,7 +2417,7 @@ def vw_rows(s, x, y, w, n, rows, acc, keep_big=False):
             for i, t in enumerate(side):
                 if sx + lw + 4 > x + w:
                     break
-                s.put(sx, yy + i, t[0], ch(GREY))
+                s.put(sx, yy + i, t[0], ch(r.get("ac", GREY)))
                 lx = sx + (2 if ic else 0)
                 s.put(lx, yy + i, t[1], ch(GREY))
                 vw_runs(s, lx + lw + 2, yy + i, t[2], t[3] if len(t) > 3 else TEXT, x + w - lx - lw - 2)
@@ -2457,7 +2473,7 @@ def vw_box(s, x, y, w, h, b, st, head=True):
     heading is the frame's top edge."""
     acc = b["color"]
     if head:
-        vw_head(s, x, y, w, b.get("icon", ""), b["title"], acc, b.get("right", ""))
+        vw_head(s, x, y, w, b.get("icon", ""), b["title"], acc, b.get("right", ""), b.get("ac"))
         y, h = y + 1, h - 1
     side = vw_side(b, w)
     rw = min(w, b.get("rw", 58)) if side else w
@@ -2476,6 +2492,12 @@ def vw_layout(s, st, top, hero, boxes, ncols):
     most important first)."""
     w, h = s.w, s.h
     vw_frame(s, *top)
+    acc_ = soft(top[2])                                  # the view's accent, calm
+    for b in ([hero] if hero else []) + boxes:
+        b.setdefault("ac", acc_)
+        for r in b.get("rows", []):
+            if isinstance(r, dict):
+                r.setdefault("ac", acc_)
     iw, ih, gap = w - 4, h - 2, 3
     spans = [b for b in boxes if b.get("span")]         # full-width sections, right under the hero
     boxes = [b for b in boxes if not b.get("span")]
@@ -2627,7 +2649,7 @@ def view_cpu(s, st, cfg, pn):
             ("", "load avg", " ".join(f"{x:.2f}" for x in la)),
             ("", "tasks", f"{tasks[0]} running · {tasks[-1]} total"),
             ("", "up", f"{int(up // 86400)}d {int(up % 86400 // 3600):02d}:{int(up % 3600 // 60):02d}")]
-    busy = warn(sustained(st["hist"]["cpu"], 30, st), 85, 101)   # amber after 30 s above 85 %
+    busy = warn(sustained(st["hist"]["cpu"], 60, st), 85, 101)   # amber after 60 s above 85 %
     rows = [{"big": digits(total, 3), "unit": "%", "c": busy, "side": side,
              "row": ("cpu", total / 100, f"{total:3.0f}%  {favg:.2f} GHz", TEXT)}]
     crow = [(f"C{i}", v / 100, ((f"{v:3.0f}%", TEXT), (f" {fq[i][0]:3.1f} GHz" if i < len(fq) else "", GREY)), TEXT)
@@ -2642,7 +2664,7 @@ def view_cpu(s, st, cfg, pn):
         rows.append(None)
         rows += [(n, v, f"{v * 100:5.1f}%", TEXT) for n, v in split]
     hero = {"color": TEXT, "rows": rows, "rw": 56,
-            "graphs": [(st["hist"]["cpu"], 0, 100, f"{total:.0f}%  cpu", TEXT)]}
+            "graphs": [(st["hist"]["cpu"], 0, 100, f"{total:.0f}%  cpu", soft(MINT))]}
 
     # the programs using the CPU: % of all cores, threads, and the core each last ran on
     n = max(4, min(15, s.h // 3))
@@ -2720,7 +2742,7 @@ def view_memory(s, st, cfg, pn):
             ("", "pressure", f"some {psi[0]}% · full {psi[1]}%" if len(psi) > 1 else "no PSI",
              (RED if float(psi[1]) >= 5 else warn(float(psi[0]), 10, 101)) if len(psi) > 1 else TEXT),
             ("", "kernel", f"{human(kern)} slab + stacks")]
-    meters = [("used", used / tot, pc(used), TEXT), ("available", avail / tot, pc(avail), TEXT),
+    meters = [("used", used / tot, pc(used), soft(VIOLET)), ("available", avail / tot, pc(avail), TEXT),
               ("cached", m.get("Cached", 0) / tot, pc(m.get("Cached", 0)), TEXT),
               ("buffers", m.get("Buffers", 0) / tot, pc(m.get("Buffers", 0)), TEXT),
               ("free", m.get("MemFree", 0) / tot, pc(m.get("MemFree", 0)), TEXT),
@@ -2795,7 +2817,7 @@ def view_fans(s, st, cfg, pn):
                     ("min / max", None, f"{lo if lo is not None else '--'} / {mx or '--'} rpm"),
                     ("mode", None, mode[0], None, mode[1])]
         if hot:                                          # what the fan loop is answering to
-            rows.append(("cpu temp" if s.h >= 20 else "follows", hf, follows, temp_w(hot[3]), temp_w(hot[3])))
+            rows.append(("cpu temp" if s.h >= 20 else "follows", hf, follows, temp_w(hot[3], hot[4]), temp_w(hot[3], hot[4])))
         boxes.append({"title": ascii_only(lab).lower(), "icon": IC["fan"], "color": TEXT, "rows": rows, "rw": 48,
                       "keep_big": True, "spark": True, "right": f"{key} · {mode[0]}",
                       "graphs": [(d, 0, top, f"{rpm} rpm  {f * 100:.0f}%", TEXT)]})
@@ -2882,13 +2904,13 @@ def view_battery(s, st, cfg, pn):
             ("", "trend", trend)]
     if b["cap"] is not None:
         side.append(("", "kernel", f"{b['cap']}% of design charge"))
-    meters = [("charge", pct / 100, f"{pct:5.1f}%", acc, acc),
+    meters = [("charge", pct / 100, f"{pct:5.1f}%", acc if acc != TEXT else soft(GREEN), acc),
               ("limit", (b["limit"] or 100) / 100, f"{b['limit']}%" if b["limit"] else "none", TEXT)]
     rows = [{"big": digits(pct, 3), "unit": "%", "c": acc, "side": side,
              "row": ("charge", pct / 100, f"{pct:.0f}%  {st_.lower()}", acc, acc)}]
     rows += [meters] if s.h < 40 else meters
     hero = {"color": TEXT, "rows": rows, "rw": 56, "grow": 1,
-            "graphs": [(long_, 0, 100, f"{pct:.0f}%  charge, a sample a minute", chg, 60)]}
+            "graphs": [(long_, 0, 100, f"{pct:.0f}%  charge, a sample a minute", soft(GREEN), 60)]}
 
     boxes = []
     if hl:
@@ -3018,7 +3040,7 @@ def view_power(s, st, cfg, pn):
             ("", "energy", f"{e['wh']:.2f} Wh in {run_h * 60:.0f} min" if run_h < 1 else f"{e['wh']:.1f} Wh in {run_h:.1f} h"),
             ("", "average", f"{e['wh'] / run_h:.1f} W" if run_h > 0.01 else "measuring..."),
             ("", "peak", f"{e['peak']:.1f} W")]
-    heavy = warn(sustained(d, 30, st), 30, 1e9)          # amber after 30 s above 30 W
+    heavy = warn(sustained(d, 30, st), 38, 1e9)          # amber after 30 s above 38 W
     rows = [{"big": digits(min(watts, 999), 3), "unit": "W", "c": heavy, "side": side,    # whole watts
              "row": ("watts", watts / top, f"{watts:.1f} W  {src}", TEXT)}]
     hero = {"color": TEXT, "rows": rows, "rw": 56}
@@ -3028,7 +3050,7 @@ def view_power(s, st, cfg, pn):
         wr = [(name, key, guess, smc[key]) for key, name, guess in SMC_WATTS if key in smc]
         where = {"title": "where it goes", "icon": IC["plug"], "color": TEXT, "span": True, "lines": len(wr),
                  "right": "SMC watts", "fn": lambda s_, x, y, w, n: pw_rows(s_, x, y, w, n, wr), "rw": 56,
-                 "graphs": [(d, 0, top, f"{watts:.1f} W  {src}", TEXT)]}
+                 "graphs": [(d, 0, top, f"{watts:.1f} W  {src}", soft(VOLT))]}
     else:
         where = {"title": "where it goes", "icon": IC["plug"], "color": GREY, "span": True, "right": "",
                  "rows": [why], "graphs": [(d, 0, top, f"{watts:.1f} W  {src}", TEXT)]}
@@ -3223,7 +3245,7 @@ def view_network(s, st, cfg, pn):
                      ("down", None, f"{down_t.strip()}   up {up_t.strip()}")]}]   # the fallback keeps the rates
     top_ = max(max(drx), max(dtx), 1024)
     hero = {"color": TEXT, "rows": rows, "rw": 56, "across": True, "grow": 1,
-            "graphs": [(drx, 0, top_, f"down {rate(down)}", TEXT), (dtx, 0, top_, f"up {rate(up)}", TEXT)]}
+            "graphs": [(drx, 0, top_, f"down {rate(down)}", soft(LIME)), (dtx, 0, top_, f"up {rate(up)}", soft(LIME))]}
 
     boxes = []
     if s.h >= 20:                                        # half a grid cell holds the hero alone
@@ -3236,10 +3258,10 @@ def view_network(s, st, cfg, pn):
                 c_ = int(w["connected time"].split()[0])
                 wr.append(("connected", None, f"{c_ // 3600}h {c_ % 3600 // 60:02d}m"))
             if w.get("tx failed"):
-                # amber while the count climbs: more failures than a minute ago
+                # amber while the count climbs: more than 5 failures in the last minute
                 tf = pn.__dict__.setdefault("txf", deque(maxlen=max(2, round(60 / st.get("interval", 2.0)))))
                 tf.append(int(w["tx failed"]) if w["tx failed"].isdigit() else 0)
-                wr.append(("tx failed", None, w["tx failed"], None, AMBER if tf[-1] > tf[0] else TEXT))
+                wr.append(("tx failed", None, w["tx failed"], None, AMBER if tf[-1] - tf[0] > 5 else TEXT))
             boxes.append({"title": "wifi", "icon": icon, "color": TEXT, "right": w["if"], "rows": wr})
         if ts:
             boxes.append({"title": "tailscale", "color": TEXT, "right": ts["state"].lower(), "rows": [
