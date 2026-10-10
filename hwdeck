@@ -3177,33 +3177,24 @@ def view_network(s, st, cfg, pn):
     ts = tailscale(pn)
     q = (w or {}).get("q")
     icon = chr(WIFI_GLYPHS[min(3, q // 25)]) if NERD and q is not None else (IC["net"] if w else "")
-    # the readout is how full the link is: the smoothed rates against the link's rx / tx
-    # bitrates, the larger of the two, 0-100 %; with no link rate (wired, iw unreadable) the
-    # smoothed down rate in whole Mb/s; with no link at all "--"
+    # the readout is the Wi-Fi signal, the number the Touch Bar strip shows: 2 x (dBm + 100),
+    # 0-100, the mean of the last three samples; beside it how full the link is (the smoothed
+    # rates against the rx / tx bitrates, the larger), the rates at a fixed width, the address
     dq = th_hist(pn, "v:q", q) if q is not None else None
     sig = round(sum(list(dq)[-3:]) / len(list(dq)[-3:])) if dq else None
     down_t, up_t = steady_rate(pn, sd, "nu_down"), steady_rate(pn, su, "nu_up")
     mbps = lambda k: float(w[k].split()[0]) if w and re.match(r"[\d.]+ ", w.get(k, "")) and float(w[k].split()[0]) > 0 else None
     rx_r, tx_r = mbps("rx bitrate"), mbps("tx bitrate")
     use = [v * 8 / (r * 1e6) for v, r in ((sd, rx_r), (su, tx_r)) if r]
-    connected = bool(w and w.get("SSID")) or bool(route)
-    if use:
-        util = round(max(0.0, min(1.0, max(use))) * 100)
-        big, unit, frac = digits(util, 3), "%", util / 100
-        cap = f"{rx_r or tx_r:g} Mb/s link" + (f" ({tx_r:g} up)" if rx_r and tx_r and tx_r != rx_r else "")
-        side = [(icon, "of", cap)]
-    elif connected:
-        mb = min(999, round(sd * 8 / 1e6))
-        big, unit, frac, cap = digits(mb, 3), "Mb/s", None, f"{mb} Mb/s down"
-        side = [(icon, "link", f"{iface or '--'} · rate unknown")]
+    load = f"{round(max(0.0, min(1.0, max(use))) * 100)}% of {rx_r or tx_r:g} Mb/s" if use else "link rate unknown"
+    if w and w.get("SSID"):
+        side = [(icon, "wifi", w["SSID"] + (f" · {w['dbm']} dBm" if q is not None else ""))]
     else:
-        big, unit, frac, cap = "_--", "%", None, "no wifi"
         side = [(icon, "wifi", "no wifi", GREY)]
-    if q is not None:
-        side.append(("", "signal", f"{w['dbm']} dBm · {sig}%" + (f" · {w['SSID']}" if w.get("SSID") else ""), charge_c(sig, 100)))
-    side += [("", "down", down_t), ("", "up", up_t), ("", "ipv4", ip or "--")]
-    rows = [{"big": big, "unit": unit, "c": LIME, "side": side[:5],
-             "row": [("use", frac, f"{big.strip('_')}{unit} of {cap}" if frac is not None else cap, LIME, LIME),
+    side += [("", "load", load), ("", "down", down_t), ("", "up", up_t), ("", "ipv4", ip or "--")]
+    sc = charge_c(sig, 100) if sig is not None else GREY
+    rows = [{"big": digits(sig, 3) if sig is not None else "_--", "unit": "%", "c": LIME, "side": side,
+             "row": [("signal", (sig or 0) / 100, f"{sig}%" if sig is not None else "no wifi", sc, sc),
                      ("down", None, f"{down_t.strip()}   up {up_t.strip()}")]}]   # the fallback keeps the rates
     top_ = max(max(drx), max(dtx), 1024)
     hero = {"color": LIME, "rows": rows, "rw": 56, "across": True, "grow": 1,
