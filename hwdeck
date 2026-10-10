@@ -36,6 +36,11 @@ BRIGHT = {"g": "G", "y": "Y", "R": "R", "r": "R", "c": "C", "b": "B", "m": "M", 
 BLACK, TEXT, GREY = (0.0, 0.0, 0.0), (0.949, 0.949, 0.949), (0.55, 0.55, 0.57)
 MINT, ICE, VIOLET = (0.40, 0.92, 0.70), (0.33, 0.84, 1.0), (0.72, 0.56, 1.0)    # cpu, fans, memory
 AMBER, RED, VOLT, GREEN = (0.98, 0.70, 0.20), (0.95, 0.33, 0.30), (1.0, 0.84, 0.25), (0.26, 0.80, 0.45)
+# The wall's four highlight colours. A colour means the same thing on every view, never which
+# view it is (no "yellow for power"): yellow marks the leader of a list (the busiest program,
+# the biggest rail, the hottest sensor), blue is history (every graph), green is good or on
+# (headroom, healthy, connected), red is a limit or an alarm. Everything else stays white.
+HL_LEAD, HL_HIST, HL_GOOD, HL_LIMIT = VOLT, (0.36, 0.62, 1.0), GREEN, RED
 TRUECOLOR = os.environ.get("COLORTERM", "").lower() in ("truecolor", "24bit")
 SGR = {}
 
@@ -2178,7 +2183,7 @@ def draw_thermal(s, st, cfg, pn):
         ceil = max(r[4] for r in rows)
         secs.append({"title": ZONES[z][0], "icon": IC["temp"], "color": TEXT,
                      "right": f"max {mz[3]:.0f}° · {len(rows)}", "lines": len(rows), "rw": 64,
-                     "fn": lambda s_, x, y, w, n, rows=rows: th_rows(s_, x, y, w, n, rows, (hot[1], hot[2]) if hot else None, soft(ICE)),
+                     "fn": lambda s_, x, y, w, n, rows=rows: th_rows(s_, x, y, w, n, rows, (hot[1], hot[2]) if hot else None, HL_LEAD),
                      "graphs": [(pn.hist[f"th:{z}"], 20, ceil, f"{mz[3]:.0f}°C  {ascii_only(mz[0])}", TEXT)]})
 
     # the no-sensor strip: raw readings, wrapped to the column; one line on a short terminal
@@ -2222,7 +2227,7 @@ def draw_thermal(s, st, cfg, pn):
         if choice:
             break
     bs, ncols = choice or (temp_secs, maxc)
-    hero["min"] = hmin
+    hero["min"], hero["band"] = hmin, False             # every sensor row first: no shared band
     vw_layout(s, st, (IC["temp"], "thermal", ICE, ""), hero, bs, ncols)
 
 # ================================================================== views ====
@@ -2450,7 +2455,7 @@ def vw_graphs(s, x, y, w, h, graphs, st, acc, across=False):
     for (gx, gy, ww, hh), g in zip(boxes, graphs):
         d, lo, hi, lab, c = g[:5]
         step = g[5] if len(g) > 5 else st.get("interval", 2.0)   # seconds per sample
-        c = c or acc
+        c = HL_HIST if c in (None, TEXT) else c        # history is blue on every view
         grad = c if callable(c) else (lambda f, c=c: mix(faint(c, 0.45), c, f))
         s.put(gx, gy + hh - 1, "▁" * ww, faint(grad(0), 0.35))
         bt_graph(s, gx, gy, ww, hh, d, lo, hi, grad)
@@ -2485,14 +2490,17 @@ def vw_box(s, x, y, w, h, b, st, head=True):
         gap = 1 if h - used >= 5 else 0
         vw_graphs(s, x, y + used + gap, w, h - used - gap, b.get("graphs") or [], st, acc, b.get("across"))
 
+BAND_AT, BAND_GH = 12, 3      # hero rows (graph band included) and the band's height, wall-wide
+
 def vw_layout(s, st, top, hero, boxes, ncols):
     """One frame (top = icon, title, accent, note), the hero under its edge and sections in
     columns under the hero; spare rows go mostly to the hero's graph. Short screens drop the
     readout for its plain row, trim rows and drop the last sections (each view lists them
     most important first)."""
     w, h = s.w, s.h
+    top = (top[0], top[1], TEXT) + tuple(top[3:])      # no colour identity per view
     vw_frame(s, *top)
-    acc_ = soft(top[2])                                  # the view's accent, calm
+    acc_ = TEXT
     for b in ([hero] if hero else []) + boxes:
         b.setdefault("ac", acc_)
         for r in b.get("rows", []):
@@ -2522,7 +2530,16 @@ def vw_layout(s, st, top, hero, boxes, ncols):
             hh = hd + (int((ih - hd - dnat) * hero.get("grow", 0.6)) if hero.get("graphs") else 0)
         else:
             hh = max(min(hd, hero.get("min", max(6, ih // 2))), ih - dnat)
-        vw_box(s, 2, 1, iw, hh if (boxes or spans) and ih - hh >= 3 else ih, hero, st, head=False)
+        band = hero.get("graphs") and hero.get("band", True) and (boxes or spans) and ih >= 20 \
+            and not vw_side(hero, iw) and vw_nat(hero, False) <= BAND_AT - 1
+        if band:
+            # the wall's views share one geometry: the hero's graph is a band of BAND_GH rows
+            # ending on row BAND_AT, so graphs and the sections under them line up across a row
+            hh = BAND_AT
+            vw_box(s, 2, 1, iw, hh - BAND_GH, dict(hero, graphs=[]), st, head=False)
+            vw_graphs(s, 2, 1 + hh - BAND_GH, iw, BAND_GH, hero["graphs"], st, TEXT, hero.get("across"))
+        else:
+            vw_box(s, 2, 1, iw, hh if (boxes or spans) and ih - hh >= 3 else ih, hero, st, head=False)
     if ih - hh < 3:
         return
     # spans take their rows, and every row the columns do not need (their graphs grow)
@@ -2664,12 +2681,13 @@ def view_cpu(s, st, cfg, pn):
         rows.append(None)
         rows += [(n, v, f"{v * 100:5.1f}%", TEXT) for n, v in split]
     hero = {"color": TEXT, "rows": rows, "rw": 56,
-            "graphs": [(st["hist"]["cpu"], 0, 100, f"{total:.0f}%  cpu", soft(MINT))]}
+            "graphs": [(st["hist"]["cpu"], 0, 100, f"{total:.0f}%  cpu", HL_HIST)]}
 
     # the programs using the CPU: % of all cores, threads, and the core each last ran on
     n = max(4, min(15, s.h // 3))
     procs = proc_top(pn, n)
-    prow = [(name, v / 100, ((f"{v:4.1f}%", TEXT), (f" {th:>3}t c{c}", GREY)), TEXT) for name, v, th, c in procs] or ["measuring..."]
+    prow = [(name, v / 100, ((f"{v:4.1f}%", TEXT), (f" {th:>3}t c{c}", GREY)), HL_LEAD if i == 0 else TEXT)
+            for i, (name, v, th, c) in enumerate(procs)] or ["measuring..."]
     boxes = [{"title": "programs", "icon": IC["cpu"], "color": TEXT, "right": "% of all cores", "rows": prow,
               "lines": max(1, min(len(prow), 12))}]
     thr = []
@@ -2679,7 +2697,7 @@ def view_cpu(s, st, cfg, pn):
             thr.append(("package", None, f"{pn_} times  {pms / 1000:.1f}s", None, RED if pn_ else TEXT))
             thr.append(("core", None, f"{cn} times  {cms / 1000:.1f}s", None, RED if cn else TEXT))
         else:
-            thr.append(("throttled", None, "never", None, TEXT))
+            thr.append(("throttled", None, "never", None, HL_GOOD))
     else:
         thr.append("thermal_throttle counters not exposed")
     for t, name, unit in (("Processor", "passive", "steps"), ("TCC Offset", "TCC offset", "°C"), ("intel_powerclamp", "idle inject", "%")):
@@ -2688,9 +2706,9 @@ def view_cpu(s, st, cfg, pn):
             thr.append((name, cur / mx if mx else 0, f"{cur}/{mx} {unit}" if unit == "steps" else f"{cur}{unit}", AMBER if cur else TEXT))
     boxes.append({"title": "throttle", "color": TEXT, "rows": thr, "right": "since boot"})
     dclk = th_hist(pn, "v:clk", favg)
-    turbo = {0: ("on", TEXT), 1: ("off", TEXT)}.get(lim["no_turbo"], ("--", GREY))
+    turbo = {0: ("on", HL_GOOD), 1: ("off", TEXT)}.get(lim["no_turbo"], ("--", GREY))
     clk = [("turbo", None, turbo[0], None, turbo[1]),
-           ("cap", lim["cap"] / fmax if lim["cap"] else None, f"{lim['cap']:.1f} GHz" if lim["cap"] else "--", TEXT),
+           ("cap", lim["cap"] / fmax if lim["cap"] else None, f"{lim['cap']:.1f} GHz" if lim["cap"] else "--", HL_LIMIT),
            ("governor", None, f"{lim['gov'] or '--'}" + (f" / {lim['epp']}" if lim["epp"] else ""))]
     if lim["max_pct"] is not None:
         clk.append(("perf", lim["max_pct"] / 100, f"{lim['min_pct']}-{lim['max_pct']}%", TEXT))
@@ -2742,7 +2760,7 @@ def view_memory(s, st, cfg, pn):
             ("", "pressure", f"some {psi[0]}% · full {psi[1]}%" if len(psi) > 1 else "no PSI",
              (RED if float(psi[1]) >= 5 else warn(float(psi[0]), 10, 101)) if len(psi) > 1 else TEXT),
             ("", "kernel", f"{human(kern)} slab + stacks")]
-    meters = [("used", used / tot, pc(used), soft(VIOLET)), ("available", avail / tot, pc(avail), TEXT),
+    meters = [("used", used / tot, pc(used), TEXT), ("available", avail / tot, pc(avail), HL_GOOD),
               ("cached", m.get("Cached", 0) / tot, pc(m.get("Cached", 0)), TEXT),
               ("buffers", m.get("Buffers", 0) / tot, pc(m.get("Buffers", 0)), TEXT),
               ("free", m.get("MemFree", 0) / tot, pc(m.get("MemFree", 0)), TEXT),
@@ -2756,7 +2774,8 @@ def view_memory(s, st, cfg, pn):
 
     n = max(4, min(20, s.h // 3))
     top = top_mem(n)
-    trows = [(f"{name}" + (f" x{cnt}" if cnt > 1 else ""), rss / tot, f"{human(rss):>7}", TEXT) for name, rss, cnt in top]
+    trows = [(f"{name}" + (f" x{cnt}" if cnt > 1 else ""), rss / tot, f"{human(rss):>7}", HL_LEAD if i == 0 else TEXT)
+             for i, (name, rss, cnt) in enumerate(top)]
     boxes = [{"title": "top", "icon": IC["mem"], "color": TEXT, "right": "rss by program", "rows": trows,
               "lines": min(len(trows), 10)}]
 
@@ -2904,17 +2923,17 @@ def view_battery(s, st, cfg, pn):
             ("", "trend", trend)]
     if b["cap"] is not None:
         side.append(("", "kernel", f"{b['cap']}% of design charge"))
-    meters = [("charge", pct / 100, f"{pct:5.1f}%", acc if acc != TEXT else soft(GREEN), acc),
-              ("limit", (b["limit"] or 100) / 100, f"{b['limit']}%" if b["limit"] else "none", TEXT)]
+    meters = [("charge", pct / 100, f"{pct:5.1f}%", acc if acc != TEXT else HL_GOOD, acc),
+              ("limit", (b["limit"] or 100) / 100, f"{b['limit']}%" if b["limit"] else "none", HL_LIMIT)]
     rows = [{"big": digits(pct, 3), "unit": "%", "c": acc, "side": side,
              "row": ("charge", pct / 100, f"{pct:.0f}%  {st_.lower()}", acc, acc)}]
     rows += [meters] if s.h < 40 else meters
     hero = {"color": TEXT, "rows": rows, "rw": 56, "grow": 1,
-            "graphs": [(long_, 0, 100, f"{pct:.0f}%  charge, a sample a minute", soft(GREEN), 60)]}
+            "graphs": [(long_, 0, 100, f"{pct:.0f}%  charge, a sample a minute", HL_HIST, 60)]}
 
     boxes = []
     if hl:
-        hrows = [("health", hl, f"{hl * 100:.0f}%", chg(hl), chg(hl)),
+        hrows = [("health", hl, f"{hl * 100:.0f}%", HL_GOOD if hl >= 0.8 else AMBER, TEXT),
                  ("full now", None, amt(b["full"])), ("design", None, amt(b["design"])),
                  ("worn", None, f"{(1 - hl) * 100:.0f}% lost")]
         if b["cycles"] is not None:
@@ -2997,13 +3016,16 @@ def pw_rows(s, x, y, w, n, rows):
     kw = 7 if w >= 44 else 0
     namew = max(8, min(20, w - 15 - kw))
     top = max((r[3] for r in rows), default=1) or 1
+    # the leader is the biggest consumer, not the totals (system, adapter in)
+    lead = max((r for r in rows if r[1] not in ("PSTR", "PD0R")), key=lambda r: r[3], default=None)
     shown = rows if len(rows) <= n else rows[: n - 1]
     for i, (name, key, guess, v) in enumerate(shown):
         s.put(x, y + i, name[:namew], ch(GREY))
         if kw:
             s.put(x + namew + 1, y + i, key + ("?" if guess else ""), ch(faint(GREY, 0.6)))
         if w - namew - kw - 10 >= 3:
-            vw_meter(s, x + namew + 1 + kw, y + i, w - namew - kw - 10, v / top, TEXT)
+            vw_meter(s, x + namew + 1 + kw, y + i, w - namew - kw - 10, v / top,
+                     HL_LEAD if lead and key == lead[1] else TEXT)
         s.put(x + w - 7, y + i, f"{v:5.1f} W", TEXT)
     if len(rows) > n:
         s.put(x, y + n - 1, f"+{len(rows) - n + 1} more", GREY)
@@ -3043,32 +3065,28 @@ def view_power(s, st, cfg, pn):
     heavy = warn(sustained(d, 30, st), 38, 1e9)          # amber after 30 s above 38 W
     rows = [{"big": digits(min(watts, 999), 3), "unit": "W", "c": heavy, "side": side,    # whole watts
              "row": ("watts", watts / top, f"{watts:.1f} W  {src}", TEXT)}]
-    hero = {"color": TEXT, "rows": rows, "rw": 56}
+    hero = {"color": TEXT, "rows": rows, "rw": 56,
+            "graphs": [(d, 0, top, f"{watts:.1f} W  {src}", HL_HIST)]}
 
     # where it goes: the SMC's rails, full width, with the system's history under them
     if smc is not None:
         wr = [(name, key, guess, smc[key]) for key, name, guess in SMC_WATTS if key in smc]
-        where = {"title": "where it goes", "icon": IC["plug"], "color": TEXT, "span": True, "lines": len(wr),
-                 "right": "SMC watts", "fn": lambda s_, x, y, w, n: pw_rows(s_, x, y, w, n, wr), "rw": 56,
-                 "graphs": [(d, 0, top, f"{watts:.1f} W  {src}", soft(VOLT))]}
+        where = {"title": "where it goes", "icon": IC["plug"], "color": TEXT, "lines": len(wr),
+                 "right": "SMC watts", "fn": lambda s_, x, y, w, n: pw_rows(s_, x, y, w, n, wr)}
     else:
-        where = {"title": "where it goes", "icon": IC["plug"], "color": GREY, "span": True, "right": "",
-                 "rows": [why], "graphs": [(d, 0, top, f"{watts:.1f} W  {src}", TEXT)]}
+        where = {"title": "where it goes", "icon": IC["plug"], "color": GREY, "right": "", "rows": [why]}
     boxes = [where]
     # wakeups: interrupts and context switches per second, and the busiest interrupt sources
     irqs = irq_rates(pn, max(3, min(10, s.h // 4)))
     wtop = max((r for _, r in irqs), default=1)
     wk = [("interrupts", None, f"{k.get('intr', 0):,.0f}/s"), ("switches", None, f"{k.get('ctxt', 0):,.0f}/s")]
-    wk += [(nm[:14], r / wtop, f"{r:,.0f}/s", TEXT) for nm, r in irqs]
+    wk += [(nm[:14], r / wtop, f"{r:,.0f}/s", HL_LEAD if i == 0 else TEXT) for i, (nm, r) in enumerate(irqs)]
     boxes.append({"title": "wakeups", "color": TEXT, "right": "per second", "rows": wk, "lines": min(len(wk), 7)})
     # RAPL is secondary now that the SMC reports the package
     if readable:
         rr = [(n_, (w or 0) / max(pkg or 0, w or 0, 1), f"{w:.2f} W" if w is not None else "--", TEXT) for n_, w in doms]
         boxes.append({"title": "rapl", "color": TEXT, "right": f"{pkg:.1f} W" if pkg is not None else "", "rows": rr})
-    else:
-        boxes.append({"title": "rapl", "color": GREY, "right": "not readable yet",
-                      "rows": [(n_, None, "locked", None, GREY) for n_, _ in doms] + ["root-only for now"]
-                      if doms else ["no RAPL counters"]})
+    # unreadable RAPL (root-only) says nothing the SMC rails do not: no box for it
     if b:
         boxes.append({"title": "battery rail", "color": TEXT, "right": "", "rows": [
             ("current", None, f"{sign}{abs(b['cur'] or 0) / 1e6:.3f} A"), ("voltage", None, f"{(b['volt'] or 0) / 1e6:.2f} V")]})
@@ -3245,7 +3263,7 @@ def view_network(s, st, cfg, pn):
                      ("down", None, f"{down_t.strip()}   up {up_t.strip()}")]}]   # the fallback keeps the rates
     top_ = max(max(drx), max(dtx), 1024)
     hero = {"color": TEXT, "rows": rows, "rw": 56, "across": True, "grow": 1,
-            "graphs": [(drx, 0, top_, f"down {rate(down)}", soft(LIME)), (dtx, 0, top_, f"up {rate(up)}", soft(LIME))]}
+            "graphs": [(drx, 0, top_, f"down {rate(down)}", HL_HIST), (dtx, 0, top_, f"up {rate(up)}", HL_HIST)]}
 
     boxes = []
     if s.h >= 20:                                        # half a grid cell holds the hero alone
@@ -3266,7 +3284,7 @@ def view_network(s, st, cfg, pn):
         if ts:
             boxes.append({"title": "tailscale", "color": TEXT, "right": ts["state"].lower(), "rows": [
                 ("address", None, ts["ip"]),
-                ("peers", ts["online"] / max(1, ts["peers"]), f"{ts['online']}/{ts['peers']} online", TEXT),
+                ("peers", ts["online"] / max(1, ts["peers"]), f"{ts['online']}/{ts['peers']} online", HL_GOOD),
                 ("exit node", None, ts["exit"] or "none")]})
         v6 = re.search(r"inet6 (\S+)", run("ip", "-6", "-o", "addr", "show", "dev", iface, "scope", "global", timeout=1)) if iface else None
         v6net = (":".join(v6.group(1).split("/")[0].split(":")[:4]) + "::/" + v6.group(1).split("/")[1]) if v6 else "--"
