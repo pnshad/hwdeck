@@ -63,15 +63,30 @@ hwdeck --view network    # Wi-Fi SSID, band, signal and link rate, IPv4, live do
 hwdeck --view thermal    # every temperature sensor and fan by zone (the same as --style thermal)
 ```
 
-The views are drawn in the visual language of the Touch Bar strip rather than btop's: a pure
-black screen, one accent colour per subject (CPU mint, fans cyan, memory violet, power yellow,
-network lime, temperatures cyan warming through amber to red, battery red at empty, yellow at half, green at
-the charge limit), grey labels, and one rounded frame in the accent. Under its top edge sits
-the hero: the main number as a 7-segment LED readout (lit segments in the accent, unlit ones
-faintly visible; the same size in every view, five rows, the unit on its bottom row), its
-facts beside it, its rows and the history graph. Sections follow in
-columns, each with its own heading and graph where one says something. Headings and the main
-facts carry a Nerd Font icon.
+The views are drawn in the white of the Touch Bar strip's clock on deep black: the readouts,
+values, meters, rules and graphs in white and greys, labels in grey, one rounded grey frame
+per view. Under its top edge sits the hero: the main number as a 7-segment LED readout (lit
+segments white, unlit ones faintly visible; the same size in every view, five rows, the unit
+on its bottom row), its facts beside it, its rows and the history graph. Sections follow in
+columns, each with its own heading and graph where one says something.
+
+Colour is kept for two things. **Identity:** each view's title icon wears its subject's
+accent (CPU mint, thermal and fans cyan, network lime, memory violet, power yellow, battery
+green), and nothing else does. **Attention:** a value turns amber or red only when it crosses
+a threshold, on its text and its meter, never a whole section:
+
+| View | Amber | Red |
+|---|---|---|
+| thermal, fans | a temperature at 72 °C | at 90 °C |
+| cpu | load above 85 % for 30 s (the readout) | a throttle event since boot |
+| power | draw above 30 W for 30 s (the readout) | |
+| battery | 20 % or less, or empty within the hour | 10 % or less |
+| memory | pressure (PSI some avg10) at 10 %, swap over 64 MB in use | PSI full avg10 at 5 % |
+| network | signal under 40 %, failed transmissions climbing over the last minute | signal at 20 % |
+
+The cpu `throttle` section's cooling steps (ACPI passive, TCC offset, idle injection) show
+amber while a step is active. In normal operation a view shows one coloured element: its
+icon.
 
 Together the views make a wall (cpu, thermal, network, memory, power and battery side by
 side), and each fact lives on exactly one of them: temperatures and fans in thermal, watts
