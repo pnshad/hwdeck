@@ -2252,7 +2252,7 @@ VIEWS = ("cpu", "memory", "fans", "battery", "power", "network", "thermal")
 NERD = os.environ.get("TERM") != "linux"                 # the kernel console has no Nerd Font
 IC = {k: chr(v) if NERD else "" for k, v in (("cpu", 0xF061A), ("temp", 0xF050F), ("fan", 0xF0210),
                                              ("mem", 0xF035B), ("plug", 0xF06A5), ("bat", 0xF0079),
-                                             ("net", 0xF0928))}
+                                             ("net", 0xF0928), ("unplug", 0xF06A6))}
 BAT_GLYPHS = (0xF008E, 0xF007A, 0xF007B, 0xF007C, 0xF007D, 0xF007E, 0xF007F, 0xF0080, 0xF0081, 0xF0082, 0xF0079)
 
 def warn(v, amber, red, low=False):
@@ -2343,7 +2343,7 @@ def vw_frame(s, icon, title, c, right, clock=False):
     clock = f" {time.strftime('%H:%M:%S')} " if clock else ""
     cx = (w - len(clock)) // 2
     if clock and cx > 3 + len(head) and cx + len(clock) < rx:
-        s.put(cx, 0, clock, ch(GREY))
+        s.put(cx, 0, clock, ch(mix(GREY, HL_HIST, 0.6)))
 
 def vw_head(s, x, y, w, icon, title, c, right="", ac=None):
     """A section heading: its icon in the view's accent, the title in grey, a faint rule, a
@@ -2411,7 +2411,7 @@ def vw_rows(s, x, y, w, n, rows, acc, keep_big=False):
         elif big(r):
             L, c = r.get("L", 3), r["c"]
             bw = seg7(s, x, yy, r["big"], c, L)
-            ac = c if c != TEXT else r.get("ac", c)      # a warning colours the unit too
+            ac = c if c != TEXT else HL_HIST              # a warning colours the unit too
             if r.get("unit"):
                 s.put(x + bw + 1, yy + L + 1, r["unit"], ac)
                 bw += len(r["unit"]) + 1
@@ -2456,14 +2456,46 @@ def vw_graphs(s, x, y, w, h, graphs, st, acc, across=False):
         d, lo, hi, lab, c = g[:5]
         step = g[5] if len(g) > 5 else st.get("interval", 2.0)   # seconds per sample
         c = HL_HIST if c in (None, TEXT) else c        # history is blue on every view
-        grad = c if callable(c) else (lambda f, c=c: mix(faint(c, 0.45), c, f))
-        s.put(gx, gy + hh - 1, "▁" * ww, faint(grad(0), 0.35))
-        bt_graph(s, gx, gy, ww, hh, d, lo, hi, grad)
-        if hh >= 2:
+        vw_chart(s, gx, gy, ww, hh, d, lo, hi, c)
+        if hh >= 2:                                     # the label rides on the chart's top row
             s.put(gx, gy, lab[: ww - 9], TEXT)
             span = len(d) * step
             if ww - len(lab) >= 16:
                 s.put(gx + ww - 7, gy, (f"{span / 60:4.1f}m" if span < 5400 else f"{span / 3600:4.1f}h")[-7:], GREY)
+
+BRAILLE = ((0x01, 0x02, 0x04, 0x40), (0x08, 0x10, 0x20, 0x80))   # dot bits, top to bottom, per column
+
+def vw_chart(s, x, y, w, h, data, lo, hi, color):
+    """A history as the Touch Bar strip draws its CPU chart: a thin line (braille, two samples
+    and four levels a cell) over a faint fill, newest at the right, the newest point a brighter
+    dot. `color` is a colour or a function of height 0..1 (temperature gradients)."""
+    H = h * 4
+    vals = list(data)[-2 * w:]
+    pad = 2 * w - len(vals)
+    lev = [round(max(0.0, min(1.0, (v - lo) / (hi - lo))) * (H - 1)) if hi > lo else 0 for v in vals]
+    cells, low = {}, {}
+    prev = None
+    for i, yv in enumerate(lev):
+        dx = pad + i
+        span = range(min(prev, yv), max(prev, yv) + 1) if prev is not None else (yv,)
+        for d in span:                                   # dots up from the bottom, joined to the last
+            r = H - 1 - d
+            key = (dx // 2, r // 4)
+            cells[key] = cells.get(key, 0) | BRAILLE[dx % 2][r % 4]
+            low[dx // 2] = min(low.get(dx // 2, H), d)
+        prev = yv
+    col = color if callable(color) else (lambda f, c=color: c)
+    for (cx, cr), bits in cells.items():
+        s.put(x + cx, y + cr, chr(0x2800 + bits), col(1 - cr / max(1, h - 1)) if callable(color) else color)
+    for cx, d in low.items():                            # the fill: cells wholly under the line
+        for cr in range(h):
+            if (h - 1 - cr) * 4 + 3 < d:
+                c = col(1 - cr / max(1, h - 1))
+                s.put(x + cx, y + cr, " ", c, faint(c, 0.16))
+    if lev:                                              # now: a brighter dot at the right end
+        dx, r = pad + len(lev) - 1, H - 1 - lev[-1]
+        s.put(x + dx // 2, y + r // 4, chr(0x2800 + (cells.get((dx // 2, r // 4), 0) | BRAILLE[dx % 2][r % 4])),
+              mix(col(lev[-1] / max(1, H - 1)), (1, 1, 1), 0.5))
 
 def vw_nat(b, head=True):
     return (1 if head else 0) + (b.get("lines") or vw_lines(b.get("rows", [])))
@@ -2490,7 +2522,7 @@ def vw_box(s, x, y, w, h, b, st, head=True):
         gap = 1 if h - used >= 5 else 0
         vw_graphs(s, x, y + used + gap, w, h - used - gap, b.get("graphs") or [], st, acc, b.get("across"))
 
-BAND_AT, BAND_GH = 12, 3      # hero rows (graph band included) and the band's height, wall-wide
+BAND_AT, BAND_GH = 13, 4      # hero rows (graph band included) and the band's height, wall-wide
 
 def vw_layout(s, st, top, hero, boxes, ncols):
     """One frame (top = icon, title, accent, note), the hero under its edge and sections in
@@ -2498,7 +2530,8 @@ def vw_layout(s, st, top, hero, boxes, ncols):
     readout for its plain row, trim rows and drop the last sections (each view lists them
     most important first)."""
     w, h = s.w, s.h
-    top = (top[0], top[1], TEXT) + tuple(top[3:])      # no colour identity per view
+    # no colour identity per view; a state colour (the plug: green on AC, amber unplugged) stays
+    top = (top[0], top[1], top[2] if top[2] in (GREEN, AMBER, RED) else TEXT) + tuple(top[3:])
     vw_frame(s, *top)
     acc_ = TEXT
     for b in ([hero] if hero else []) + boxes:
@@ -2944,7 +2977,7 @@ def view_battery(s, st, cfg, pn):
     # events: each status change since hwdeck started, newest first
     erows = [(time.strftime("%H:%M", time.localtime(t)), None, f"{stt.lower()} at {p:.0f}%") for t, stt, p in reversed(ev)]
     boxes.append({"title": "events", "color": TEXT, "right": "since start", "rows": erows, "lines": min(len(erows), 6)})
-    vw_layout(s, st, (icon, "battery", GREEN, ascii_only(b["model"] or b["name"])), hero, boxes,
+    vw_layout(s, st, (icon, "battery", GREEN if ac else acc, ascii_only(b["model"] or b["name"])), hero, boxes,
               1 if s.w < 60 else (2 if s.w < 200 else 3))
 
 # ---------------------------------------------------------------- power ----
@@ -3057,7 +3090,7 @@ def view_power(s, st, cfg, pn):
     e["wh"] += raw * (now - e["t"]) / 3600
     e["t"], e["peak"] = now, max(e["peak"], raw)
     run_h = (now - e["t0"]) / 3600
-    side = [(IC["plug"] if ac else IC["bat"], "source", "AC adapter" if ac else ("battery" if b else "--")),
+    side = [(IC["plug"] if ac else IC["unplug"], "source", "AC adapter" if ac else ("battery" if b else "--")),
             ("", "battery", f"{sign}{bw:.1f} W {way}" if b else "none"),
             ("", "energy", f"{e['wh']:.2f} Wh in {run_h * 60:.0f} min" if run_h < 1 else f"{e['wh']:.1f} Wh in {run_h:.1f} h"),
             ("", "average", f"{e['wh'] / run_h:.1f} W" if run_h > 0.01 else "measuring..."),
@@ -3090,7 +3123,7 @@ def view_power(s, st, cfg, pn):
     if b:
         boxes.append({"title": "battery rail", "color": TEXT, "right": "", "rows": [
             ("current", None, f"{sign}{abs(b['cur'] or 0) / 1e6:.3f} A"), ("voltage", None, f"{(b['volt'] or 0) / 1e6:.2f} V")]})
-    vw_layout(s, st, (IC["plug"] if ac else IC["bat"], "power", VOLT, src), hero, boxes,
+    vw_layout(s, st, (IC["plug"] if ac else IC["unplug"], "power", GREEN if ac else AMBER, src), hero, boxes,
               1 if s.w < 60 else (2 if s.w < 200 else 3))
 
 # -------------------------------------------------------------- network ----
@@ -3263,7 +3296,7 @@ def view_network(s, st, cfg, pn):
                      ("down", None, f"{down_t.strip()}   up {up_t.strip()}")]}]   # the fallback keeps the rates
     top_ = max(max(drx), max(dtx), 1024)
     hero = {"color": TEXT, "rows": rows, "rw": 56, "across": True, "grow": 1,
-            "graphs": [(drx, 0, top_, f"down {rate(down)}", HL_HIST), (dtx, 0, top_, f"up {rate(up)}", HL_HIST)]}
+            "graphs": [(drx, 0, top_, f"down {rate(down)}", HL_HIST), (dtx, 0, top_, f"up {rate(up)}", HL_GOOD)]}
 
     boxes = []
     if s.h >= 20:                                        # half a grid cell holds the hero alone
