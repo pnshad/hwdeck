@@ -48,6 +48,38 @@ The same data, five ways to draw it, plus a sixth that shows only heat and air. 
 any size from 50×14: more columns on a wide screen, then it drops the summary box and trims
 rows on a short one.
 
+## Views
+
+A view puts one part of the machine on the whole screen, for a hotkey or a Touch Bar tap.
+Pick one with `--view`; each is one flag:
+
+```bash
+hwdeck --view cpu        # per-core load and clock, the CPU split, temperatures, throttling
+hwdeck --view memory     # used / available / cached / buffers / swap, and the top memory users
+hwdeck --view fans       # every fan, large
+hwdeck --view battery    # charge, health, power in and out, the charge limit, battery temperatures
+hwdeck --view thermal    # every temperature sensor and fan by zone (the same as --style thermal)
+```
+
+Every view is drawn in the `btop` design language: a full-width box on top with a big
+numeral, its rows and the big history graph, then detail boxes in columns under it, each
+with its own graph where one says something.
+
+| View | What it shows |
+|---|---|
+| **`cpu`** | Total load as a big numeral and graph; per-core load, clock and core temperature; user / system / iowait / irq split and load average. `temp`: coretemp plus the CPU SMC keys, with the hottest one's history. `throttle`: thermal-throttle event counts and time since boot (core and package), ACPI passive cooling steps, the TCC offset, idle injection, headroom to the CPU's critical temperature, package watts (RAPL, root-only on most kernels). `clock`: average clock against the maximum with its history, min / max / base, the scaling cap, governor and energy preference, driver, turbo, intel_pstate perf limits. |
+| **`memory`** | Used share as a big numeral and graph; used, available, cached, buffers, free, shared and swap meters. `swap`: every swap device and zram's compression ratio, with history. `top`: resident memory per program name, summed over its processes, from `/proc/*/statm`. `cache`: page cache, buffers, reclaimable slab, active / inactive file pages, dirty and writeback, with history. |
+| **`fans`** | One box per fan: rpm in big numerals, % of max, the SMC target, min and max, auto or manual mode, the CPU temperature the fan loop is answering to, and an rpm history. |
+| **`battery`** | Charge as `charge_now / charge_full` (the kernel's `capacity` divides by the design capacity, which on a worn pack reads low; it is shown beside it), status, time to full or empty, the charge limit, the AC adapter, and a charge history. `power`: watts in or out, current, voltage, with a watts history. `health`: `charge_full` against `charge_full_design`, cycle count, chemistry and model. `temp`: the battery's hwmon sensor and the SMC keys `TB0T`, `TB1T`, `TB2T`, `TBXT`, with history. |
+
+The charge limit is read from `charge_control_end_threshold`, on the battery or, on Intel
+Macs, on the `applesmc` platform device. Batteries that report energy (`energy_now`,
+`power_now`) work the same as those that report charge.
+
+Views fit themselves to any size from 50×14. On a short screen the big numerals give way to
+a plain row, the last detail boxes are dropped and long lists end in "+N more". Graphs fill
+in as hwdeck runs; a `--once` frame has one sample.
+
 ## What it reads
 
 | Group | Sources |
@@ -83,8 +115,9 @@ Ctrl-C to quit. For fan speeds, voltages and board temperatures install lm-senso
 (`sudo apt install lm-sensors`, then `sudo sensors-detect`); some boards need a driver
 module, for example `nct6775`.
 
-Options: `--style NAME` (`btop`, `bunker`, `eq`, `panel`, `glance`, `thermal`), `--config FILE` (default `~/.config/hwdeck/config.toml`),
-`--interval SECONDS`, `--once` (draw one frame and exit). Every setting is optional; see
+Options: `--style NAME` (`btop`, `bunker`, `eq`, `panel`, `glance`, `thermal`), `--view NAME`
+(`cpu`, `memory`, `fans`, `battery`, `thermal`; wins over `--style`), `--config FILE` (default
+`~/.config/hwdeck/config.toml`), `--interval SECONDS`, `--once` (draw one frame and exit). Every setting is optional; see
 [`config.example.toml`](config.example.toml).
 
 ## As a wall or desk screen
@@ -115,6 +148,8 @@ On a bare Linux console, `setterm -blank 0` keeps the screen on, and
   don't have braille. Half-block graphs give two levels per cell and render everywhere.
 - **Read-only by design.** hwdeck only reads `/proc`, `/sys`, `sensors` and `systemctl
   is-active`, plus any `[extra]` commands you add to your own config.
+- **Hardware, not programs**, with one exception: the `memory` view lists the programs using
+  the most memory, two small reads per process each refresh.
 - **CPU package power** comes from the RAPL counter, which most kernels only let root read;
   without it that reading is left out.
 

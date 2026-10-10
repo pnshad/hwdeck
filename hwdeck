@@ -7,7 +7,8 @@ laptop): 16 colours and CP437 glyphs only, so it renders on a plain VT with the 
 kernel font. Pure Python 3 standard library; reads /proc and /sys, no root needed.
 `sensors -j` (lm-sensors) and `nvidia-smi` are used when present.
 
-Usage:  hwdeck [--style btop|bunker|eq|panel|glance|thermal] [--config FILE] [--interval SECONDS] [--once]
+Usage:  hwdeck [--style btop|bunker|eq|panel|glance|thermal] [--view cpu|memory|fans|battery|thermal]
+        [--config FILE] [--interval SECONDS] [--once]
 """
 import argparse, json, os, re, shutil, socket, subprocess, sys, time
 from collections import deque
@@ -2154,6 +2155,476 @@ def draw_thermal(s, st, cfg, pn):
                 s.put(gx + gw - 8, gy, f"{span / 60:4.1f}min"[-8:], "K")
             y += bh
 
+# ================================================================== views ====
+# One thing per screen, full size, for a tap on a Touch Bar or a hotkey: --view cpu,
+# memory, fans or battery (thermal is the zoned style above). Same btop language: a
+# full-width hero box with a big numeral and the big history graph, then detail boxes
+# packed into columns by th_layout. A box is a dict of rows and graphs; a row is
+#   (name, frac, value, meter colour[, value colour])   frac None = no meter; value may
+#                                                       be a tuple of (text, colour) runs
+#   [row, row]                                          drawn side by side
+#   {"big": text, "c": colour, "side": [lines], "row": fallback}  3x5 numerals; the
+#                                                       fallback row (or nothing) on a small box
+#   "text"                                              a dim note;  None = blank line
+
+VIEWS = ("cpu", "memory", "fans", "battery", "thermal")
+
+def vw_len(val):
+    return len(val) if isinstance(val, str) else sum(len(t) for t, _ in val)
+
+def vw_line(s, x, y, w, r, namew, valw):
+    name, frac, val, c, vc = (r + (None, "W"))[:5] if len(r) == 3 else (r + ("W",))[:5]
+    s.put(x, y, name[:namew], "w")
+    if isinstance(val, str):
+        val = val[: max(0, w - namew - 1)]
+    if frac is not None and w - namew - valw - 2 >= 3:
+        bt_meter(s, x + namew + 1, y, w - namew - valw - 2, frac, c)
+    vx = x + w - vw_len(val)
+    for txt, cc in ((val, vc),) if isinstance(val, str) else val:
+        s.put(vx, y, txt, cc)
+        vx += len(txt)
+
+def vw_rows(s, x, y, w, n, rows, keep_big=False):
+    """Rows into a w x n area; returns the lines used. Big numerals fall back to their plain
+    row when they do not fit (keep_big: unless only the rows under them would be cut), and
+    rows past the bottom collapse into "+N more"."""
+    big = lambda r: isinstance(r, dict)
+    if (sum(6 if big(r) else 1 for r in rows) > n and not (keep_big and n >= 8)) or w < 30:
+        rows = [r.get("row") if big(r) else r for r in rows]
+        rows = [r for i, r in enumerate(rows) if r is not None or 0 < i < len(rows) - 1]
+    lines = [6 if big(r) else 1 for r in rows]
+    if sum(lines) > n:
+        k = next(i for i in range(len(rows)) if sum(lines[: i + 1]) > n - 1)
+        rows = rows[:k] + [f"+{len(rows) - k} more"] if n > 1 else rows[:n]
+    single = [r for r in rows if isinstance(r, tuple)]
+    multi = [t for r in rows if isinstance(r, list) for t in r]
+    widths = lambda rs, cw: (min(max((len(t[0]) for t in rs), default=0), max(4, cw // 3)),
+                             max((vw_len(t[2]) for t in rs if t[1] is not None), default=0))
+    yy = y
+    for r in rows:
+        if isinstance(r, str):
+            s.put(x, yy, ascii_only(r)[:w], "K")
+        elif big(r):
+            bw = bigtext(s, x, yy, r["big"], r["c"])
+            for i, ln in enumerate(r.get("side", [])[:5]):
+                s.put(x + bw + 3, yy + i, ln[: w - bw - 3], "W" if i == 0 else "w")
+            yy += 5
+        elif isinstance(r, list):
+            cw = (w - 2 * (len(r) - 1)) // len(r)
+            nw, vw = widths(multi, cw)
+            for i, t in enumerate(r):
+                vw_line(s, x + i * (cw + 2), yy, cw, t, nw, vw)
+        elif r is not None:
+            vw_line(s, x, yy, w, r, *widths(single, w))
+        yy += 1
+    return yy - y
+
+def vw_graphs(s, x, y, w, h, graphs, st):
+    """Stacked history graphs, each labelled with its value and the time it spans."""
+    n = min(len(graphs), h // 3)
+    if n <= 0 or w < 12:
+        return
+    gh = [h // n + (1 if i < h % n else 0) for i in range(n)]
+    for i, (d, lo, hi, lab, grad) in enumerate(graphs[:n]):
+        gy = y + sum(gh[:i])
+        bt_graph(s, x, gy, w, gh[i], d, lo, hi, grad or bt_grad)
+        s.put(x, gy, lab[: w - 10], "W")
+        span = len(d) * st.get("interval", 2.0)
+        s.put(x + w - 8, gy, f"{span / 60:4.1f}min"[-8:], "K")
+
+def vw_nat(b):
+    lines = b.get("lines") or sum(6 if isinstance(r, dict) else 1 for r in b.get("rows", []))
+    return 2 + lines + (4 * len(b["graphs"]) if b.get("graphs") else 0)
+
+def vw_box(s, x, y, w, h, b, st):
+    """A box: rows (or b["fn"]) on the right with the graphs beside them on the left, like
+    btop's cpu box; on a narrow box the rows sit on top and the graphs fill below."""
+    bt_box(s, x, y, w, h, b.get("num", ""), b["title"], b["color"], centre=b.get("centre"),
+           right=(b.get("right") or "")[: max(0, w - len(b["title"]) - 12)] or None)
+    inner, iw = h - 2, w - 4
+    graphs = b.get("graphs") or []
+    rw = min(iw, b.get("rw", 58))
+    side = graphs and iw - rw >= 32                     # a graph narrower than that says little
+    rw = rw if side else iw
+    rx = x + w - 2 - rw
+    draw_rows = b.get("fn") or (lambda s_, x_, y_, w_, n_: vw_rows(s_, x_, y_, w_, n_, b.get("rows", []), b.get("keep_big")))
+    used = draw_rows(s, rx, y + 1, rw, inner)
+    if side:
+        vw_graphs(s, x + 1, y + 1, iw - rw - 1, inner, graphs, st)
+    elif inner - used - 1 >= 3:
+        vw_graphs(s, x + 2, y + 2 + used, iw, inner - used - 1, graphs, st)
+
+def vw_layout(s, st, hero, boxes, ncols):
+    """Hero across the top, detail boxes in columns under it. The hero keeps at least about
+    half the screen; spare rows go mostly to its graph, short screens trim the details."""
+    w, h = s.w, s.h
+    clock = time.strftime("%H:%M:%S")
+    for i, b in enumerate(([hero] if hero else []) + boxes):
+        b["num"] = i + 1
+    if not hero:
+        boxes[0].setdefault("centre", clock)
+    else:
+        hero.setdefault("centre", clock)
+    ncols = max(1, min(ncols, len(boxes)))
+    nat = [(i, vw_nat(b)) for i, b in enumerate(boxes)]
+    dnat = max((sum(n for _, n in c) for c in th_pack(nat, ncols)), default=0) if boxes else 0
+    if not hero:
+        hh = 0
+    elif vw_nat(hero) + dnat <= h:
+        hh = vw_nat(hero) + (h - vw_nat(hero) - dnat) * 3 // 5
+    else:
+        hh = max(min(vw_nat(hero), max(6, h // 2)), h - dnat)
+    if hero:
+        vw_box(s, 0, 0, w, hh if boxes and h - hh >= 3 else h, hero, st)
+    if not boxes or h - hh < 3:
+        return
+    # a box shorter than three rows says little: drop the last boxes (the least
+    # important, each view lists them in order) until the rest fit at that size
+    while len(nat) > 1 and max(sum(min(n, 5) for _, n in c) for c in th_pack(nat, ncols)) > h - hh:
+        nat.pop()
+    ncols = min(ncols, len(nat))
+    cols, _ = th_layout(nat, ncols, h - hh)
+    colw = [w // ncols + (1 if i < w % ncols else 0) for i in range(ncols)]
+    for ci, col in enumerate(cols):
+        x, y = sum(colw[:ci]), hh
+        for i, bh in col:
+            vw_box(s, x, y, colw[ci], bh, boxes[i], st)
+            y += bh
+
+def vw_temps(zone):
+    """Live rows of one thermal zone, hwmon chips first then SMC keys, for th_rows."""
+    rows = [(name, key, guess, t, ceil) for z, name, key, guess, t, ceil in thermal_channels()[0]
+            if z == zone and not no_sensor(t)]
+    return sorted(rows, key=lambda r: not r[1].startswith("temp"))
+
+def vw_temp_box(pn, rows, title, color, key, lo=20):
+    if not rows:
+        return None
+    mz = max(rows, key=lambda r: r[3])
+    d = th_hist(pn, key, mz[3])
+    return {"title": title, "color": color, "right": f"max {mz[3]:.0f}°C  {len(rows)}", "lines": len(rows),
+            "fn": lambda s, x, y, w, n: th_rows(s, x, y, w, n, rows), "rw": 52,
+            "graphs": [(d, lo, max(r[4] for r in rows), f"{mz[3]:.0f}°C  {mz[0]}", None)]}
+
+def ivals(path, *keys):
+    """Integer sysfs files under one directory, None where unreadable."""
+    out = []
+    for k in keys:
+        v = read(f"{path}/{k}")
+        out.append(int(v) if v and v.lstrip("-").isdigit() else None)
+    return out
+
+# ------------------------------------------------------------------ cpu ----
+def cpu_limits(n):
+    """What can hold the CPU back, from what sysfs lets a user read: thermal-throttle
+    counters, intel_pstate limits, and the kernel's cooling devices (ACPI passive steps,
+    the TCC offset, idle injection)."""
+    base = "/sys/devices/system/cpu"
+    lim = {"throttle": None, "cool": {}}
+    if os.path.isdir(f"{base}/cpu0/thermal_throttle"):
+        seen, core_n, core_ms = set(), 0, 0
+        for i, cid in enumerate(core_ids(n)):
+            if cid not in seen:
+                seen.add(cid)
+                cn, cms = ivals(f"{base}/cpu{i}/thermal_throttle", "core_throttle_count", "core_throttle_total_time_ms")
+                core_n, core_ms = core_n + (cn or 0), core_ms + (cms or 0)
+        pk_n, pk_ms = ivals(f"{base}/cpu0/thermal_throttle", "package_throttle_count", "package_throttle_total_time_ms")
+        lim["throttle"] = (core_n, core_ms, pk_n or 0, pk_ms or 0)
+    lim["no_turbo"], lim["min_pct"], lim["max_pct"] = ivals(f"{base}/intel_pstate", "no_turbo", "min_perf_pct", "max_perf_pct")
+    cf = f"{base}/cpu0/cpufreq"
+    lim["gov"], lim["epp"], lim["driver"] = (read(f"{cf}/{k}") for k in ("scaling_governor", "energy_performance_preference", "scaling_driver"))
+    lim["fmin"], lim["fmax"], lim["base"], lim["cap"] = (
+        (v or 0) / 1e6 for v in ivals(cf, "cpuinfo_min_freq", "cpuinfo_max_freq", "base_frequency", "scaling_max_freq"))
+    root = "/sys/class/thermal"
+    for d in sorted(os.listdir(root)) if os.path.isdir(root) else []:
+        if d.startswith("cooling_device"):
+            t = read(f"{root}/{d}/type") or ""
+            cur, mx = ivals(f"{root}/{d}", "cur_state", "max_state")
+            if t in ("Processor", "TCC Offset", "intel_powerclamp") and cur is not None:
+                old = lim["cool"].get(t, (0, mx))
+                lim["cool"][t] = (max(old[0], cur), mx)    # the most throttled of the cores
+    return lim
+
+def view_cpu(s, st, cfg, pn):
+    k = pn.counters.sample().get("cpu", {})
+    cores, total = st["cores"], st["cpu"]
+    fq = core_freqs(len(cores))
+    favg = sum(c for c, _ in fq) / len(fq) if fq else 0
+    lim = cpu_limits(len(cores))
+    temps = vw_temps("cpu")
+    core_t = {int(m.group(1)): r[3] for r in temps if (m := re.fullmatch(r"core (\d+)", r[0]))}
+    pkg = next((r for r in temps if r[0] == "CPU package"), max(temps, key=lambda r: r[3], default=None))
+    ids = core_ids(len(cores))
+    tcol = lambda t: bt_grad((t - 20) / 80)
+
+    rows = [{"big": f"{total:.0f}%", "c": bt_grad(total / 100),
+             "side": ["cpu load", f"{favg:.2f} GHz average", f"{len(cores)} threads  {len(set(ids))} cores",
+                      f"package {pkg[3]:.0f}°C" if pkg else ""],
+             "row": ("CPU", total / 100, f"{total:3.0f}%", None)}]
+    crow = []
+    for i, v in enumerate(cores):
+        t = core_t.get(ids[i])
+        val = ((f"{v:3.0f}% ", "W"), (f"{fq[i][0]:3.1f}G" if i < len(fq) else "", "C"))
+        if t is not None:
+            val += ((f" {t:3.0f}°C", tcol(t)),)
+        crow.append((f"C{i}", v / 100, val, None))
+    rows += [crow[i:i + 2] for i in range(0, len(crow), 2)] if len(crow) > 8 else crow
+    rows.append(None)
+    split = [("user", k.get("user", 0), "G"), ("system", k.get("system", 0), "r"), ("iowait", k.get("iowait", 0), "y"),
+             ("irq", k.get("irq", 0) + k.get("softirq", 0), "m"), ("nice", k.get("nice", 0), "c"), ("steal", k.get("steal", 0), "K")]
+    rows += [(n, v, f"{v * 100:5.1f}%", c) for n, v, c in split if n not in ("nice", "steal") or v > 0.001]
+    la = st["load"]
+    rows.append(("load", la[0] / max(1, len(cores)), " ".join(f"{x:4.2f}" for x in la), "C"))
+    hero = {"title": "cpu", "color": BT["cpu"], "right": ascii_only(st["cpu_model"]), "rows": rows, "rw": 56,
+            "graphs": [(st["hist"]["cpu"], 0, 100, f"{total:.0f}%  cpu", None)]}
+
+    boxes = []
+    tb = vw_temp_box(pn, temps, "temp", BT["temp"], "v:cput")
+    if tb:
+        boxes.append(tb)
+    dclk = th_hist(pn, "v:clk", favg)
+    fmax = lim["fmax"] or max((m for _, m in fq), default=0) or 1
+    turbo = {0: ("on", "G"), 1: ("off", "y")}.get(lim["no_turbo"], ("--", "K"))
+    clk = [("clock", favg / fmax, f"{favg:.2f} / {fmax:.1f} GHz", "C"),
+           ("range", None, f"{lim['fmin']:.1f} - {fmax:.1f} GHz" + (f"  base {lim['base']:.1f}" if lim["base"] else "")),
+           ("cap", lim["cap"] / fmax if lim["cap"] else None, f"{lim['cap']:.1f} GHz" if lim["cap"] else "--", "c"),
+           ("governor", None, f"{lim['gov'] or '--'}" + (f" / {lim['epp']}" if lim["epp"] else "")),
+           ("driver", None, lim["driver"] or "--"),
+           ("turbo", None, turbo[0], None, turbo[1])]
+    if lim["max_pct"] is not None:
+        clk.append(("perf", lim["max_pct"] / 100, f"{lim['min_pct']}-{lim['max_pct']}%", "c"))
+    clock = {"title": "clock", "color": "c", "right": f"{favg:.2f} GHz", "rows": clk, "rw": 46,
+             "graphs": [(dclk, 0, fmax, f"{favg:.2f} GHz", None)]}
+    thr = []
+    if lim["throttle"]:
+        cn, cms, pn_, pms = lim["throttle"]
+        thr.append(("package hits", None, f"{pn_}  {pms / 1000:.1f}s", None, "G" if pn_ == 0 else "R"))
+        thr.append(("core hits", None, f"{cn}  {cms / 1000:.1f}s", None, "G" if cn == 0 else "R"))
+    else:
+        thr.append("thermal_throttle counters not exposed")
+    for t, name, unit in (("Processor", "passive", "steps"), ("TCC Offset", "TCC offset", "°C"), ("intel_powerclamp", "idle inject", "%")):
+        if t in lim["cool"]:
+            cur, mx = lim["cool"][t]
+            thr.append((name, cur / mx if mx else 0, f"{cur}/{mx} {unit}" if unit == "steps" else f"{cur}{unit}", None))
+    if pkg:
+        crit = pkg[4]
+        thr.append(("headroom", (pkg[3] - 20) / (crit - 20), f"{crit - pkg[3]:.0f}°C to {crit:.0f}", None, tcol(pkg[3])))
+    watts = pn.cpu_power()
+    thr.append(("package W", None, f"{watts:.1f} W") if watts is not None else
+               "package watts: RAPL is root-only here" if os.path.exists("/sys/class/powercap/intel-rapl:0") else "no RAPL counter")
+    hits = lim["throttle"] and (lim["throttle"][0] or lim["throttle"][2])
+    boxes.append({"title": "throttle", "color": "R" if hits else "y", "rows": thr,
+                  "right": "throttled since boot" if hits else ("never throttled" if lim["throttle"] else "")})
+    boxes.append(clock)                                  # most important first: a short screen drops the last
+    vw_layout(s, st, hero, boxes, 1 if s.w < 80 else (2 if s.w < 200 else 3))
+
+# --------------------------------------------------------------- memory ----
+def meminfo():
+    m = {}
+    for line in (read("/proc/meminfo", "") or "").splitlines():
+        k, v = line.split(":", 1)
+        m[k] = int(v.split()[0]) * 1024
+    return m
+
+def top_mem(n):
+    """Resident memory per program name, summed over its processes, from /proc/*/statm:
+    two small reads per process, cheap enough to do every refresh. Shared pages count
+    once per process, so a family of processes reads a little high."""
+    page, agg = os.sysconf("SC_PAGE_SIZE"), {}
+    for pid in os.listdir("/proc"):
+        if not pid.isdigit():
+            continue
+        f = (read(f"/proc/{pid}/statm") or "").split()
+        rss = int(f[1]) * page if len(f) > 1 else 0
+        if rss:                                          # kernel threads have none
+            a = agg.setdefault(read(f"/proc/{pid}/comm") or pid, [0, 0])
+            a[0] += rss
+            a[1] += 1
+    return sorted(((ascii_only(k), *v) for k, v in agg.items()), key=lambda r: -r[1])[:n]
+
+def view_memory(s, st, cfg, pn):
+    m = meminfo()
+    tot = m.get("MemTotal", 1)
+    avail = m.get("MemAvailable", 0)
+    used = tot - avail
+    swt, swu = m.get("SwapTotal", 0), m.get("SwapTotal", 0) - m.get("SwapFree", 0)
+    pc = lambda v, t=tot: f"{human(v):>8} {v / t * 100 if t else 0:3.0f}%"
+    rows = [{"big": f"{used / tot * 100:.0f}%", "c": bt_grad(used / tot),
+             "side": ["memory used", f"{human(used)} of {human(tot)}", f"{human(avail)} available",
+                      f"swap {human(swu)} of {human(swt)}" if swt else "no swap"]},
+            ("used", used / tot, pc(used), None), ("available", avail / tot, pc(avail), "G"),
+            ("cached", m.get("Cached", 0) / tot, pc(m.get("Cached", 0)), "C"),
+            ("buffers", m.get("Buffers", 0) / tot, pc(m.get("Buffers", 0)), "c"),
+            ("free", m.get("MemFree", 0) / tot, pc(m.get("MemFree", 0)), "B"),
+            ("shared", m.get("Shmem", 0) / tot, pc(m.get("Shmem", 0)), "M"),
+            ("swap", swu / swt if swt else 0, pc(swu, swt), "m")]
+    hero = {"title": "mem", "color": BT["mem"], "right": f"{tot / 2**30:.1f} GiB", "rows": rows, "rw": 56,
+            "graphs": [(st["hist"]["mem"], 0, 100, f"{used / tot * 100:.0f}%  used", None)]}
+
+    cache = m.get("Cached", 0) + m.get("Buffers", 0)
+    dc = th_hist(pn, "v:cache", cache / tot * 100)
+    crows = [("page cache", m.get("Cached", 0) / tot, human(m.get("Cached", 0)), "C"),
+             ("buffers", m.get("Buffers", 0) / tot, human(m.get("Buffers", 0)), "c"),
+             ("reclaimable", m.get("SReclaimable", 0) / tot, human(m.get("SReclaimable", 0)), "g"),
+             ("file active", m.get("Active(file)", 0) / tot, human(m.get("Active(file)", 0)), "C"),
+             ("file inactive", m.get("Inactive(file)", 0) / tot, human(m.get("Inactive(file)", 0)), "c"),
+             ("dirty", None, human(m.get("Dirty", 0))), ("writeback", None, human(m.get("Writeback", 0)))]
+    cachebox = {"title": "cache", "color": "c", "right": human(cache), "rows": crows, "rw": 44,
+                "graphs": [(dc, 0, 100, f"{cache / tot * 100:.0f}%  cache + buffers", None)]}
+
+    ds = th_hist(pn, "v:swap", swu / swt * 100 if swt else 0)
+    srows = [("swap used", swu / swt if swt else 0, f"{human(swu)} / {human(swt)}", "m"),
+             ("swap cached", None, human(m.get("SwapCached", 0)))]
+    for line in (read("/proc/swaps", "") or "").splitlines()[1:]:
+        f = line.split()
+        if len(f) >= 5:
+            sz, u = int(f[2]) * 1024, int(f[3]) * 1024
+            srows.append((os.path.basename(f[0])[:14], u / sz if sz else 0, f"{human(u)} / {human(sz)}  p{f[4]}", "M"))
+    for z in sorted(os.listdir("/sys/block")) if os.path.isdir("/sys/block") else []:
+        mm = (read(f"/sys/block/{z}/mm_stat") or "").split() if z.startswith("zram") else []
+        if len(mm) >= 2 and int(mm[0]):
+            srows.append((f"{z} ratio", None, f"{int(mm[0]) / max(1, int(mm[1])):.1f}:1  {human(int(mm[0]))} in {human(int(mm[1]))}"))
+    if m.get("Zswap"):
+        srows.append(("zswap", None, f"{human(m.get('Zswapped', 0))} in {human(m['Zswap'])}"))
+    boxes = [{"title": "swap", "color": "m", "right": f"{swu / swt * 100:.0f}%" if swt else "none", "rows": srows,
+                  "rw": 44, "graphs": [(ds, 0, 100, f"{swu / swt * 100 if swt else 0:.0f}%  swap", None)]}]
+
+    n = max(4, min(20, s.h // 3))
+    top = top_mem(n)
+    trows = [(f"{name}" + (f" x{cnt}" if cnt > 1 else ""), rss / tot, f"{human(rss):>7}", "y") for name, rss, cnt in top]
+    boxes.append({"title": "top", "color": BT["mem"], "right": "rss by program", "rows": trows, "lines": min(len(trows), 10)})
+    boxes.append(cachebox)                               # most important first: a short screen drops the last
+    vw_layout(s, st, hero, boxes, 1 if s.w < 80 else (2 if s.w < 200 else 3))
+
+# ----------------------------------------------------------------- fans ----
+def view_fans(s, st, cfg, pn):
+    fans = thermal_channels()[1]
+    if not fans:
+        s.put(0, 0, "hwdeck fans: this machine has no hwmon fan channels", "Y")
+        return
+    cpu = vw_temps("cpu")
+    hot = max(cpu, key=lambda r: r[3], default=None)
+    boxes = []
+    for lab, key, rpm, lo, mx, tgt, man in fans:
+        d = th_hist(pn, f"fan:{key}:{lab}", rpm)
+        top = mx or max(max(d), 1)
+        f = rpm / top
+        rows = [{"big": f"{rpm}", "c": "B", "side": ["rpm", f"{f * 100:.0f}% of max", "manual" if man else "auto (SMC)"],
+                 "row": ("rpm", f, f"{rpm} rpm", "B")},
+                ("speed", f, f"{f * 100:3.0f}%", None),
+                ("target", (tgt or 0) / top, f"{tgt} rpm" if tgt is not None else "--", "c"),
+                ("min", (lo or 0) / top, f"{lo} rpm" if lo is not None else "--", "b"),
+                ("max", None, f"{mx} rpm" if mx else "--"),
+                ("mode", None, "manual" if man else "auto", None, "Y" if man else "G")]
+        if hot:
+            hf = (hot[3] - 20) / (hot[4] - 20)          # what the fan loop is answering to
+            rows.append(("cpu temp", hf, f"{hot[3]:.0f}°C" + ("" if hot[1].startswith("temp") else f" {hot[1]}"), None, bt_grad(hf)))
+        boxes.append({"title": ascii_only(lab).lower(), "color": BT["cool"], "rows": rows, "rw": 48, "keep_big": True,
+                      "right": f"{key}  {'manual' if man else 'auto'}",
+                      "graphs": [(d, 0, top, f"{rpm} rpm  {f * 100:.0f}%", None)]})
+    vw_layout(s, st, None, boxes, 1 if len(fans) <= 3 or s.w < 160 else 2)
+
+# -------------------------------------------------------------- battery ----
+def battery_info():
+    """The first system battery and the mains adapters. Charge is charge_now / charge_full:
+    `capacity` divides by the design capacity on some drivers (applesmc among them), which
+    on a worn pack reads low. Energy-reporting batteries (µWh, power_now) work the same."""
+    base = "/sys/class/power_supply"
+    names = sorted(os.listdir(base)) if os.path.isdir(base) else []
+    bat = next((n for n in names if read(f"{base}/{n}/type") == "Battery" and read(f"{base}/{n}/scope") != "Device"), None)
+    if not bat:
+        return None
+    p = f"{base}/{bat}"
+    b = {"name": bat, "unit": "Ah"}
+    b["now"], b["full"], b["design"], b["cur"] = ivals(p, "charge_now", "charge_full", "charge_full_design", "current_now")
+    b["volt"], b["vmin"], b["cycles"], b["cap"] = ivals(p, "voltage_now", "voltage_min_design", "cycle_count", "capacity")
+    b["watts"] = abs(b["cur"]) * b["volt"] / 1e12 if b["cur"] is not None and b["volt"] else None
+    if b["now"] is None:                                 # energy units: µWh and µW
+        b["now"], b["full"], b["design"], pw = ivals(p, "energy_now", "energy_full", "energy_full_design", "power_now")
+        b["unit"], b["watts"] = "Wh", abs(pw) / 1e6 if pw is not None else None
+        b["cur"] = pw / b["volt"] * 1e6 if pw is not None and b["volt"] else None
+    b["status"] = read(f"{p}/status") or "Unknown"
+    b["model"] = " ".join(x for x in (read(f"{p}/manufacturer"), read(f"{p}/model_name")) if x)
+    b["tech"] = read(f"{p}/technology")
+    lim, src = None, None
+    for f in (f"{p}/charge_control_end_threshold", "/sys/devices/platform/applesmc.768/charge_control_end_threshold"):
+        v = read(f)
+        if v and v.isdigit():
+            lim, src = int(v), f
+            break
+    b["limit"], b["limit_src"] = lim, src
+    b["ac"] = [(n, read(f"{base}/{n}/online") == "1") for n in names if read(f"{base}/{n}/type") == "Mains"]
+    return b
+
+def view_battery(s, st, cfg, pn):
+    b = battery_info()
+    if not b or not b["full"]:
+        s.put(0, 0, "hwdeck battery: no system battery under /sys/class/power_supply", "Y")
+        return
+    pct = b["now"] / b["full"] * 100
+    ac = any(on for _, on in b["ac"])
+    st_ = b["status"]
+    cur = abs(b["cur"] or 0) / 1e6                       # amps
+    u = 1e6
+    if st_ == "Discharging" and cur > 0.01:
+        hrs = b["now"] / u / cur
+        eta = f"{int(hrs)}h {int(hrs * 60 % 60):02d}m to empty"
+    elif st_ == "Charging" and cur > 0.01:
+        goal = b["full"] * (b["limit"] or 100) / 100
+        hrs = max(0, goal - b["now"]) / u / cur
+        eta = f"{int(hrs)}h {int(hrs * 60 % 60):02d}m to {b['limit'] or 100}%"
+    elif b["limit"] and ac and pct >= b["limit"] - 3:
+        eta = f"holding at the {b['limit']}% limit"
+    else:
+        eta = "on AC, not charging" if ac else "idle"
+    sign = {"Charging": "+", "Discharging": "-"}.get(st_, "")
+    way = {"Charging": "in", "Discharging": "out"}.get(st_, "")
+    watts = b["watts"] or 0
+    chg = lambda f: bt_grad(1 - f)                       # red when low, green when full
+    cc = "R" if pct < 15 else ("y" if pct < 30 else "G")
+    unit = b["unit"]
+    amt = lambda v: f"{v / u:.2f} {unit}"
+    rows = [{"big": f"{pct:.0f}%", "c": cc, "side": [st_.lower(), eta, f"{amt(b['now'])} of {amt(b['full'])}",
+                                                    f"{sign}{watts:.1f} W {way}".strip() if watts > 0.05 else "no current"]},
+            ("charge", pct / 100, f"{pct:5.1f}%", "G"),
+            ("limit", (b["limit"] or 100) / 100, f"{b['limit']}%" if b["limit"] else "none", "y"),
+            ("kernel %", (b["cap"] or 0) / 100, f"{b['cap']}% of design" if b["cap"] is not None else "--", "K"),
+            ("status", None, st_, None, "G" if st_ in ("Charging", "Full") else ("Y" if st_ == "Discharging" else "W")),
+            ("AC", None, ", ".join(f"{n} {'online' if on else 'offline'}" for n, on in b["ac"]) or "no adapter", None, "G" if ac else "K"),
+            ("time", None, eta)]
+    dpct = th_hist(pn, "v:batpct", pct)
+    hero = {"title": "battery", "color": BT["power"], "right": ascii_only(b["model"] or b["name"]), "rows": rows, "rw": 56,
+            "graphs": [(dpct, 0, 100, f"{pct:.0f}%  charge", chg)]}
+
+    boxes = []
+    if b["design"]:
+        hl = b["full"] / b["design"]
+        hrows = [("health", hl, f"{hl * 100:.0f}%", "G", chg(hl)),
+                 ("full now", None, amt(b["full"])), ("design", None, amt(b["design"])),
+                 ("worn", None, f"{(1 - hl) * 100:.0f}% of design lost")]
+        if b["cycles"] is not None:
+            hrows.append(("cycles", min(1, b["cycles"] / 1000), f"{b['cycles']} of ~1000", "y"))
+        hrows.append(("cell", None, " ".join(x for x in (b["tech"], b["model"]) if x) or "--"))
+        boxes.append({"title": "health", "color": "g", "right": f"{hl * 100:.0f}%", "rows": hrows})
+    dw = th_hist(pn, "v:batw", watts)
+    volt = (b["volt"] or 0) / u
+    vmin = (b["vmin"] or 0) / u
+    prows = [("watts", watts / max(max(dw), 10), f"{sign}{watts:.2f} W {way}".strip(), "Y"),
+             ("current", None, f"{sign}{cur:.3f} A"),
+             ("voltage", (volt - vmin) / (vmin * 0.15) if vmin else None, f"{volt:.3f} V", "y"),
+             ("min design", None, f"{vmin:.2f} V" if vmin else "--")]
+    boxes.insert(0, {"title": "power", "color": BT["power"], "right": f"{sign}{watts:.1f} W", "rows": prows, "rw": 44,
+                     "graphs": [(dw, 0, max(max(dw), 10), f"{sign}{watts:.1f} W {way}".strip(), None)]})
+    # power before health: most important first, a short screen drops the last box
+    tb = vw_temp_box(pn, vw_temps("battery"), "temp", BT["temp"], "v:batt")
+    if tb:
+        boxes.append(tb)
+    vw_layout(s, st, hero, boxes, 1 if s.w < 80 else (2 if s.w < 200 else 3))
+
+def draw_view(s, st, cfg, pn, name):
+    {"cpu": view_cpu, "memory": view_memory, "fans": view_fans, "battery": view_battery,
+     "thermal": draw_thermal}[name](s, st, cfg, pn)
+
 def main():
     ap = argparse.ArgumentParser(description="one-page hardware dashboard for a terminal or Linux console")
     ap.add_argument("--config", default=os.path.expanduser("~/.config/hwdeck/config.toml"))
@@ -2161,6 +2632,8 @@ def main():
     ap.add_argument("--once", action="store_true", help="draw one frame and exit (for testing)")
     ap.add_argument("--style", choices=["bunker", "btop", "eq", "panel", "glance", "thermal"],
                     help="btop: btop-like boxes (default); bunker: heavy chassis of meters; eq: equalizer bars; panel: control-room lamps; glance: big numerals; thermal: every temperature sensor and fan, by zone. eq/panel need 120x46")
+    ap.add_argument("--view", choices=VIEWS,
+                    help="one thing full screen instead of a style: cpu, memory, fans, battery, or thermal (the same as --style thermal)")
     ap.add_argument("--version", action="version", version=f"hwdeck {VERSION}")
     args = ap.parse_args()
 
@@ -2175,12 +2648,13 @@ def main():
     extra_cmds = cfg.get("extra", {}).get("commands", [])
 
     cpu, gpu = Cpu(), Gpu()
-    style = args.style or cfg.get("style", "btop")
+    style = args.view or args.style or cfg.get("style", "btop")
     pn = Panel()
     hist = {k: deque(maxlen=HIST) for k in ("cpu", "gpu", "gpw", "mem", "rx", "tx")}
     last_net, last_io, slow_t = None, None, 0
     services, extra = [], []
     cpu.sample()                                          # prime the deltas
+    pn.counters.sample()
     if not args.once:
         sys.stdout.write(ESC + "?25l" + ESC + "2J")
     try:
@@ -2220,8 +2694,8 @@ def main():
                      "kernel": f"{os.uname().sysname} {os.uname().release}", "cpu": total, "cores": cores,
                      "cpu_freq": freq, "gpu": g, "mem": mem, "temps": temps, "fans": fans, "net": (iface, rx, tx),
                      "disks": mounts(), "io": io_rate, "services": services, "extra": extra, "interval": interval}
-            if style == "thermal" and w >= 50 and h >= 14:   # scales itself down to a small terminal
-                draw_thermal(s, state, cfg, pn)
+            if style in VIEWS and w >= 50 and h >= 14:      # views fit themselves to a small terminal
+                draw_view(s, state, cfg, pn, style)
             elif w < 100 or h < 40:
                 s.put(0, 0, f"hwdeck needs at least 100x40, this terminal is {w}x{h}", "Y")
             elif style == "btop" and w >= 128 and h >= 46:

@@ -1,6 +1,7 @@
 # hwdeck configuration. Copy to ~/.config/hwdeck/config.toml (every key is optional).
 
-# Look: btop (default), bunker, eq, panel or glance.
+# Look: btop (default), bunker, eq, panel, glance or thermal, or one of the full-screen
+# views: cpu, memory, fans, battery (--view on the command line wins over this).
 # style = "btop"
 
 # Shown instead of the hostname.
