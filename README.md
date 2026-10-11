@@ -65,9 +65,8 @@ hwdeck --view thermal    # every temperature sensor and fan by zone (the same as
 
 The views are drawn in the white of the Touch Bar strip's clock on deep black: the readouts,
 values, meters, rules and graphs in white and greys, labels in grey, one rounded grey frame
-per view. Under its top edge sits the hero: the main number as a 7-segment LED readout (lit
-segments white, unlit ones faintly visible; the same size in every view, five rows, the unit
-on its bottom row), its facts beside it, its rows and the history graph. Sections follow in
+per view. Under its top edge sits the hero: the view's key facts in two label-value columns, its rows
+and the history graph (no big single number: it only repeated the graph's label). Sections follow in
 columns, each with its own heading and graph where one says something.
 
 Colour is kept for two things. **Identity:** each view's subject accent (CPU mint, thermal
@@ -105,9 +104,9 @@ foot's padding matches, and gives it back on exit.
 |---|---|
 | **`cpu`** | Total load as the readout; beside it cores and threads, average clock, load average, running and total tasks, uptime. Per-core load and clock; the user / system / iowait / irq split; load history. `programs`: the busiest processes since the last frame, from `/proc/*/stat`, with % of all cores, threads and the core each last ran on. `throttle`: thermal-throttle event counts and time since boot (core and package), ACPI passive cooling steps, the TCC offset, idle injection. `clock`: turbo, the scaling cap, governor and energy preference, intel_pstate perf limits, min / max / base, driver, with clock history. The cpu view also carries the wall's one clock, in its frame. |
 | **`memory`** | Used share as the readout; beside it used of total, committed of the commit limit, memory pressure (PSI `avg10`, some and full) and kernel memory (slab, stacks, page tables). Used, available, cached, buffers, free, shared and swap meters. `top`: resident memory per program name, summed over its processes, from `/proc/*/statm`. `swap`: swap cached, every swap device and zram's compression ratio, with history. `cache`: reclaimable slab, active / inactive file pages, dirty and writeback, with history. |
-| **`fans`** | One section per fan, side by side: rpm as the LED readout, % of max, the SMC target, min and max, auto or manual mode, the CPU temperature the fan loop is answering to, and an rpm history. |
+| **`fans`** | One section per fan, side by side: rpm, % of max, the SMC target, min and max, auto or manual mode, the CPU temperature the fan loop is answering to, and an rpm history. |
 | **`battery`** | Charge as the readout, `charge_now / charge_full` (the kernel's `capacity` divides by the design capacity, which on a worn pack reads low; it is shown beside it). Beside it: status, time to full or empty or held at the limit, charge in Ah, and the trend in %/h since hwdeck started. Charge and charge-limit meters, and a charge history at a sample a minute (12 hours). `health`: `charge_full` against `charge_full_design`, cycle count, chemistry. `events`: each status change since hwdeck started, with the time and charge. Watts, current, voltage and the adapter are in `power`; battery temperatures are in `thermal`. |
-| **`power`** | The whole system's draw as the readout, in whole watts: the Apple SMC's `PSTR` key, the mean of the last three samples, on AC or battery alike. It comes from a root service on the Mac that writes the SMC's power keys every 2 s to `/run/mac13-smc-power.json` (`{"t": unix, "watts": {key: W}}`, world-readable; `HWDECK_SMC_POWER` points elsewhere); older than 10 s counts as stale. Without it the readout falls back to the battery's watts (`current_now` x `voltage_now`) and the view says "SMC power service not running" (or "stale") in one line. Beside it: the source (AC adapter or battery), the battery's watts in or out, the energy used since the view started (the draw integrated frame by frame), its average and its peak. `where it goes`, full width: system `PSTR`, adapter in `PD0R`, CPU package `PCPT`, CPU cores `PCPC`, graphics `PCPG` and battery / platform `PPBR?` (a guess), each named with its raw key and a meter, over the system's history. `wakeups`: interrupts and context switches per second, and the busiest interrupt sources from `/proc/interrupts` (what keeps waking the machine). `rapl`: the RAPL domains in watts, or "locked" while `energy_uj` is root-only. `battery rail`: current and voltage. |
+| **`power`** | The whole system's draw as the readout, in whole watts: the Apple SMC's `PSTR` key, the mean of the last three samples, on AC or battery alike. It comes from a root service that writes the SMC's power keys every 2 s to `/run/omk-smc-power.json` (the `smc-power` module of [omarchy-mac-kit](https://github.com/pnshad/omarchy-mac-kit), or anything else that writes that file) (`{"t": unix, "watts": {key: W}}`, world-readable; `HWDECK_SMC_POWER` points elsewhere); older than 10 s counts as stale. Without it the readout falls back to the battery's watts (`current_now` x `voltage_now`) and the view says "SMC power service not running" (or "stale") in one line. Beside it: the source (AC adapter or battery), the battery's watts in or out, the energy used since the view started (the draw integrated frame by frame), its average and its peak. `where it goes`, full width: system `PSTR`, adapter in `PD0R`, CPU package `PCPT`, CPU cores `PCPC`, graphics `PCPG` and battery / platform `PPBR?` (a guess), each named with its raw key and a meter, over the system's history. `wakeups`: interrupts and context switches per second, and the busiest interrupt sources from `/proc/interrupts` (what keeps waking the machine). `rapl`: the RAPL domains in watts, or "locked" while `energy_uj` is root-only. `battery rail`: current and voltage. |
 | **`network`** | The Wi-Fi signal as the readout, the same number the Touch Bar strip shows: `2 x (dBm + 100)` in whole %, clamped 0-100, the mean of the last three samples (`--` and "no wifi" without a link). Beside it: the SSID and dBm; the link's load, `max(down bits/s / rx bitrate, up bits/s / tx bitrate)` from the smoothed rates and the bitrates `iw` reports ("0% of 360 Mb/s"); the IPv4 address, and the down and up rates, smoothed over about 5 s, each in a unit that changes only after the rate has wanted another one for 4 s and always `ddd.d` wide. Down / up graphs side by side under it (raw, not smoothed). Wi-Fi comes from `iw dev <if> link` (no root), else `/proc/net/wireless` and `nmcli -t`; the interface is the default route's (or `net_interface` in the config). On a taller window: `wifi` (band, channel, frequency, rx / tx rates, time connected and failed transmissions from `iw station dump`), `tailscale` (state, this node's tailnet address, peers online, exit node, from `tailscale status --json` at most every 15 s), `ip` (router, DNS via `resolvectl dns` behind systemd-resolved's stub, the IPv6 prefix, MAC) and `since boot` (bytes down / up per interface). The frame names the host. |
 | **`thermal`** | Every temperature and the fans. The hottest live sensor as the readout, in whole °C, coloured by the strip's 50 / 72 / 90 °C (cyan, amber, red); beside it its friendly name and key, the live / no-sensor counts, and each fan's rpm, % of max and the temperature its loop follows (the SMC's `TC0F` on a Mac). Then one section per zone (CPU, battery, board, skin & air, storage) with a meter per sensor in its temperature colour, packed into the columns that leave the tallest one shortest; then a compact fans section and the channels that read nothing in a "no sensor" strip, which give way first on a short screen, so all 33 sensors of a MacBook Pro 14,2 show at 66 x 27. |
 
@@ -207,6 +206,21 @@ On a bare Linux console, `setterm -blank 0` keeps the screen on, and
 - **CPU package power** comes from the RAPL counter, which most kernels only let root read;
   without it that reading is left out.
 
+## Hardware
+
+| Machine | What works |
+|---|---|
+| Any Linux box (Pi, laptop, server, tablet console) | every style and view; fans and power where the kernel exposes them |
+| Intel Mac with `applesmc` | SMC sensor names and zones, fans (rpm, target, mode), charge limit |
+| MacBookPro14,2 (13" 2017, Touch Bar) | tested; all 33 sensors in `thermal`, SMC power keys in `power` (with the root service above) |
+
+SMC key names marked `?` are guesses for that key and may mean something else on other models.
+
+## Related
+
+- [touchbar-strip](https://github.com/pnshad/touchbar-strip): a Touch Bar renderer for T1 MacBooks whose slots open hwdeck views.
+- [omarchy-mac-kit](https://github.com/pnshad/omarchy-mac-kit): installs hwdeck as a wall of views on Omarchy, plus the SMC power service.
+
 ## Licence
 
-MIT. The `btop` style borrows the look of btop by Aristocratos; hwdeck shares no code with it.
+MIT. See [CREDITS.md](CREDITS.md). The `btop` style borrows the look of btop by Aristocratos; hwdeck shares no code with it.

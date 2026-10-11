@@ -2235,15 +2235,14 @@ def draw_thermal(s, st, cfg, pn):
 # memory, fans, battery or thermal (--style thermal is the same screen). Drawn in the strip's
 # visual language rather than btop's: pure black, one accent colour per subject (the strip's
 # heading icons: cpu mint, fans cyan, memory violet, temperatures cyan warming through amber
-# to red, battery red-yellow-green by charge), grey labels, a 7-segment LED readout for the
-# big number like the strip's clock, and a Nerd Font icon before the headings and the main
+# to red, battery red-yellow-green by charge), grey labels, and a Nerd Font icon before the headings and the main
 # values. One rounded frame in the accent holds a hero (the readout, its facts beside it, its
 # rows and the history graph) and then sections packed into columns by th_layout. A section
 # is a dict of rows and graphs; a row is
 #   (name, frac, value, meter colour[, value colour])   frac None = no meter; value may
 #                                                       be a tuple of (text, colour) runs
 #   [row, row]                                          drawn side by side
-#   {"big": digits, "unit": text, "c": colour,          LED readout ("_" = an unlit digit)
+#   {"big": digits, "unit": text, "c": colour,          a readout; drawn as its facts in two columns
 #    "side": [(icon, label, value[, colour])],          with facts beside it, and the
 #    "row": fallback}                                   fallback row or rows (or nothing) when short
 #   "text"                                              a dim note;  None = blank line
@@ -2286,38 +2285,6 @@ def sustained(d, secs, st):
     return sum(tail) / len(tail) if tail else 0
 
 SEG_L = 3            # every view's readout: 5 rows, 5 columns a digit, the unit on its bottom row
-SEG7 = {"0": "abcdef", "1": "bc", "2": "abdeg", "3": "abcdg", "4": "bcfg", "5": "acdfg", "6": "acdefg",
-        "7": "abc", "8": "abcdefg", "9": "abcdfg", "-": "g", "_": ""}
-
-def seg7_w(text, L, unit=""):
-    return sum(2 if ch == "." else 6 for ch in text) - 1 + (len(unit) + 1 if unit else 0)
-
-GRID = {"0": ("###", "#.#", "#.#", "#.#", "###"), "1": (".#.", "##.", ".#.", ".#.", "###"),
-        "2": ("###", "..#", "###", "#..", "###"), "3": ("###", "..#", ".##", "..#", "###"),
-        "4": ("#.#", "#.#", "###", "..#", "..#"), "5": ("###", "#..", "###", "..#", "###"),
-        "6": ("###", "#..", "###", "#.#", "###"), "7": ("###", "..#", "..#", "..#", "..#"),
-        "8": ("###", "#.#", "###", "#.#", "###"), "9": ("###", "#.#", "###", "..#", "###"),
-        "-": ("...", "...", "###", "...", "..."), "_": ("...",) * 5}
-
-def seg7(s, x, y, text, c, L=3):
-    """The readout: digits as 3 x 5 squares, like a heatmap's cells, lit in `c`; the unlit
-    squares stay faintly visible, as the faded 8s of an LCD. A square is the top half of a
-    cell (one column by half a row: square in the terminal font), with a column and half a
-    row between squares, so a digit is 5 columns by 5 rows and a space. "_" is a digit with
-    nothing lit, "." a lit square on the bottom row. Returns the width drawn. (L is kept for
-    callers.)"""
-    cx, off = 0, faint(c, 0.16)
-    for ch_ in text:
-        if ch_ == ".":
-            s.put(x + cx, y + 4, "\u2580", c)
-            cx += 2
-            continue
-        for r, line in enumerate(GRID.get(ch_, GRID["_"])):
-            for k, bit in enumerate(line):
-                s.put(x + cx + 2 * k, y + r, "\u2580", c if bit == "#" else off)
-        cx += 6
-    return cx - 1
-
 def vw_frame(s, icon, title, c, right, clock=False):
     """The view's one rounded frame: a grey edge, the title in white set into the top edge
     with its icon in the view's accent (the one place the accent shows), a note in grey, and
@@ -2397,11 +2364,11 @@ def vw_kv(s, x, y, w, facts):
     return (len(facts) + 1) // 2
 
 def vw_rows(s, x, y, w, n, rows, acc, keep_big=False):
-    """Rows into a w x n area; returns the lines used. A readout falls back to its plain row
-    when it does not fit (keep_big: unless only the rows under it would be cut), and rows past
-    the bottom collapse into "+N more"."""
+    """Rows into a w x n area; returns the lines used. A readout dict is drawn as its plain
+    row(s) (the square-digit readout is gone), and rows past the bottom collapse into "+N more".
+    keep_big is accepted for older callers and ignored."""
     big = lambda r: isinstance(r, dict) and "kv" not in r
-    if (vw_lines(rows) > n and not (keep_big and n >= SEG_L + 4)) or any(big(r) and seg7_w(r["big"], r.get("L", 3), r.get("unit", "")) > w for r in rows):
+    if any(big(r) for r in rows):                       # readouts are drawn as their plain rows
         rows = [x for r in rows for x in (r.get("row") if big(r) and isinstance(r.get("row"), list) else
                                           [r.get("row") if big(r) else r])]   # "row" may be a list of rows
         rows = [r for i, r in enumerate(rows) if r is not None or 0 < i < len(rows) - 1]
@@ -2422,25 +2389,6 @@ def vw_rows(s, x, y, w, n, rows, acc, keep_big=False):
             yy += vw_kv(s, x, yy, w, r["kv"]) - 1
         elif isinstance(r, str):
             s.put(x, yy, r[:w], faint(GREY, 0.75))
-        elif big(r):
-            L, c = r.get("L", 3), r["c"]
-            bw = seg7(s, x, yy, r["big"], c, L)
-            ac = c if c != TEXT else HL_HIST              # a warning colours the unit too
-            if r.get("unit"):
-                s.put(x + bw + 1, yy + L + 1, r["unit"], ac)
-                bw += len(r["unit"]) + 1
-            side = r.get("side", [])[: L + 2]
-            sx = x + bw + 4
-            lw = max((len(t[1]) for t in side), default=0)
-            ic = any(t[0] for t in side)
-            for i, t in enumerate(side):
-                if sx + lw + 4 > x + w:
-                    break
-                s.put(sx, yy + i, t[0], ch(r.get("ac", GREY)))
-                lx = sx + (2 if ic else 0)
-                s.put(lx, yy + i, t[1], ch(GREY))
-                vw_runs(s, lx + lw + 2, yy + i, t[2], t[3] if len(t) > 3 else TEXT, x + w - lx - lw - 2)
-            yy += L + 1
         elif isinstance(r, list):
             cw = (w - 3 * (len(r) - 1)) // len(r)
             nw, vw = widths(r if all(t[1] is None for t in r) else multi, cw)
@@ -3064,7 +3012,7 @@ def irq_rates(pn, n):
     rates = [(nm, (c - prev[k][1]) / (t - pt)) for k, (nm, c) in now.items() if k in prev and c > prev[k][1]]
     return sorted(rates, key=lambda r: -r[1])[:n]
 
-SMC_POWER = os.environ.get("HWDECK_SMC_POWER") or "/run/mac13-smc-power.json"
+SMC_POWER = os.environ.get("HWDECK_SMC_POWER") or "/run/omk-smc-power.json"
 # Apple SMC power keys -> (friendly name, guess), in the order "where it goes" lists them.
 # A root service on the Mac writes them every 2 s as {"t": unix, "watts": {key: W}}; the
 # PZ* keys are power limits and zones, not draw, and are left out.
