@@ -2159,7 +2159,7 @@ def draw_thermal(s, st, cfg, pn):
     # fans (each with the temperature its loop follows); zones' maxima sit in their headings
     spin = sum(1 for f in fans if f[2] > 0)
     side = [(IC["temp"], "hottest", f"{ascii_only(hot[1])} {hot[2]}" if hot else "--"),
-            ("", "sensors", f"{len(live)} live · {len(dead)} no sensor")]
+            ("", "sensors", f"{len(live)} live · {len(dead)} none")]
     fanline = lambda f: f"{f[2]} rpm {f[2] / f[4] * 100 if f[4] else 0:.0f}%" + (f" · {fol[3]:.0f}°C" if fol else "")
     if len(fans) <= 3:
         side += [(IC["fan"] if i == 0 else "", ascii_only(f[0]).split()[0].lower()[:7], fanline(f)) for i, f in enumerate(fans)]
@@ -2350,7 +2350,7 @@ def vw_head(s, x, y, w, icon, title, c, right="", ac=None):
     if icon:
         s.put(x, y, icon, ch(ac or c))
     right = right[: max(0, w - len(head) - 6)]
-    s.put(x + len(head) + 1, y, "─" * max(0, w - len(head) - 1 - (len(right) + 1 if right else 0)), ch(faint(c, 0.45)))
+    s.put(x + len(head) + 1, y, "─" * max(0, w - len(head) - 1 - (len(right) + 1 if right else 0)), ch(faint(HL_HIST, 0.4)))
     if right:
         s.put(x + w - len(right), y, right, ch(GREY))
 
@@ -2379,18 +2379,33 @@ def vw_line(s, x, y, w, r, namew, valw, acc):
     vw_runs(s, x + w - vw_len(val), y, val, vc, w)
 
 def vw_lines(rows):
-    return sum(r.get("L", 3) + 2 if isinstance(r, dict) else 1 for r in rows)
+    return sum((len(r["kv"]) + 1) // 2 if isinstance(r, dict) and "kv" in r else
+               r.get("L", 3) + 2 if isinstance(r, dict) else 1 for r in rows)
+
+def vw_kv(s, x, y, w, facts):
+    """Facts in two columns: a grey name, then its value right after it, cut at the column;
+    each column's names share one width. Returns the lines used."""
+    cw = (w - 3) // 2
+    for col in (0, 1):
+        items = facts[col::2]
+        nw = max((len(f[0]) for f in items), default=0)
+        for i, (name, val, c) in enumerate(items):
+            r = i * 2 + col                              # fill across, then down
+            xx, yy = x + col * (cw + 3), y + (r // 2)
+            s.put(xx, yy, name, ch(GREY))
+            s.put(xx + nw + 1, yy, str(val)[: max(0, cw - nw - 1)], c)
+    return (len(facts) + 1) // 2
 
 def vw_rows(s, x, y, w, n, rows, acc, keep_big=False):
     """Rows into a w x n area; returns the lines used. A readout falls back to its plain row
     when it does not fit (keep_big: unless only the rows under it would be cut), and rows past
     the bottom collapse into "+N more"."""
-    big = lambda r: isinstance(r, dict)
+    big = lambda r: isinstance(r, dict) and "kv" not in r
     if (vw_lines(rows) > n and not (keep_big and n >= SEG_L + 4)) or any(big(r) and seg7_w(r["big"], r.get("L", 3), r.get("unit", "")) > w for r in rows):
         rows = [x for r in rows for x in (r.get("row") if big(r) and isinstance(r.get("row"), list) else
                                           [r.get("row") if big(r) else r])]   # "row" may be a list of rows
         rows = [r for i, r in enumerate(rows) if r is not None or 0 < i < len(rows) - 1]
-    lines = [r.get("L", 3) + 2 if big(r) else 1 for r in rows]
+    lines = [r.get("L", 3) + 2 if big(r) else vw_lines([r]) for r in rows]
     if sum(lines) > n:
         k = next(i for i in range(len(rows)) if sum(lines[: i + 1]) > n - 1)
         rows = rows[:k] + [f"+{len(rows) - k} more"] if n > 1 else rows[:n]
@@ -2403,7 +2418,9 @@ def vw_rows(s, x, y, w, n, rows, acc, keep_big=False):
         return min(max((len(t[0]) for t in rs), default=0), max(4, cw * 2 // 5)), vw
     yy = y
     for r in rows:
-        if isinstance(r, str):
+        if isinstance(r, dict) and "kv" in r:
+            yy += vw_kv(s, x, yy, w, r["kv"]) - 1
+        elif isinstance(r, str):
             s.put(x, yy, r[:w], faint(GREY, 0.75))
         elif big(r):
             L, c = r.get("L", 3), r["c"]
@@ -2455,7 +2472,11 @@ def vw_graphs(s, x, y, w, h, graphs, st, acc, across=False):
         c = HL_HIST if c in (None, TEXT) else c        # history is blue on every view
         vw_chart(s, gx, gy, ww, hh, d, lo, hi, c)
         if hh >= 2:                                     # the label rides on the chart's top row
-            s.put(gx, gy, lab[: ww - 9], TEXT)
+            warned = acc not in (None, TEXT, GREY) and not callable(acc)
+            s.put(gx, gy, lab[: ww - 9], acc if warned else TEXT)
+            val = lab.split("  ")[0] if "  " in lab else ""
+            if val and not warned and not callable(c):
+                s.put(gx, gy, val[: ww - 9], c)
             span = len(d) * step
             if ww - len(lab) >= 16:
                 s.put(gx + ww - 7, gy, (f"{span / 60:4.1f}m" if span < 5400 else f"{span / 3600:4.1f}h")[-7:], GREY)
@@ -2519,7 +2540,7 @@ def vw_box(s, x, y, w, h, b, st, head=True):
         gap = 1 if h - used >= 5 else 0
         vw_graphs(s, x, y + used + gap, w, h - used - gap, b.get("graphs") or [], st, acc, b.get("across"))
 
-BAND_AT, BAND_GH = 13, 4      # hero rows (graph band included) and the band's height, wall-wide
+BAND_AT, BAND_GH = 11, 5      # hero rows (graph band included) and the band's height, wall-wide
 
 def vw_layout(s, st, top, hero, boxes, ncols):
     """One frame (top = icon, title, accent, note), the hero under its edge and sections in
@@ -2533,6 +2554,24 @@ def vw_layout(s, st, top, hero, boxes, ncols):
     acc_ = TEXT
     # the title's icon shows once: sections and readout facts repeating it go without
     same = lambda i: i and top[0] and i == top[0]
+    # no big single number: every one repeated its chart's label. Its facts take two compact
+    # columns instead, and a warning colour it carried moves to the hero chart's label
+    def unbig(b):
+        out = []
+        for r in b.get("rows", []):
+            if not isinstance(r, dict):
+                out.append(r)
+                continue
+            if r.get("c") not in (None, TEXT):
+                b["warn"] = r["c"]
+            facts = [(t[1], t[2], t[3] if len(t) > 3 else TEXT) for t in r.get("side", [])]
+            if facts:
+                out.append({"kv": facts})
+            elif r.get("row"):
+                out += r["row"] if isinstance(r["row"], list) and not isinstance(r["row"], tuple) else [r["row"]]
+        b["rows"] = out
+    for b in ([hero] if hero else []) + boxes:
+        unbig(b)
     for b in ([hero] if hero else []) + boxes:
         b.setdefault("ac", acc_)
         if same(b.get("icon")):
@@ -2572,7 +2611,7 @@ def vw_layout(s, st, top, hero, boxes, ncols):
             # ending on row BAND_AT, so graphs and the sections under them line up across a row
             hh = BAND_AT
             vw_box(s, 2, 1, iw, hh - BAND_GH, dict(hero, graphs=[]), st, head=False)
-            vw_graphs(s, 2, 1 + hh - BAND_GH, iw, BAND_GH, hero["graphs"], st, TEXT, hero.get("across"))
+            vw_graphs(s, 2, 1 + hh - BAND_GH, iw, BAND_GH, hero["graphs"], st, hero.get("warn") or TEXT, hero.get("across"))
         else:
             vw_box(s, 2, 1, iw, hh if (boxes or spans) and ih - hh >= 3 else ih, hero, st, head=False)
     if ih - hh < 3:
@@ -2790,11 +2829,10 @@ def view_memory(s, st, cfg, pn):
     psi = re.findall(r"avg10=([\d.]+)", read("/proc/pressure/memory", "") or "")
     swc = AMBER if swu >= 64 * 2**20 else TEXT           # swap actually in use
     kern = sum(m.get(x, 0) for x in ("Slab", "KernelStack", "PageTables"))
-    side = [(IC["mem"], "used", f"{human(used)} of {human(tot)}"),
-            ("", "committed", f"{human(m.get('Committed_AS', 0))} of {human(m.get('CommitLimit', 0))}"),
-            ("", "pressure", f"some {psi[0]}% · full {psi[1]}%" if len(psi) > 1 else "no PSI",
+    side = [("", "committed", f"{human(m.get('Committed_AS', 0))} of {human(m.get('CommitLimit', 0))}"),
+            ("", "pressure", f"{psi[0]}% / {psi[1]}% full" if len(psi) > 1 else "no PSI",
              (RED if float(psi[1]) >= 5 else warn(float(psi[0]), 10, 101)) if len(psi) > 1 else TEXT),
-            ("", "kernel", f"{human(kern)} slab + stacks")]
+            ("", "kernel", human(kern))]
     meters = [("used", used / tot, pc(used), TEXT), ("available", avail / tot, pc(avail), HL_GOOD),
               ("cached", m.get("Cached", 0) / tot, pc(m.get("Cached", 0)), TEXT),
               ("buffers", m.get("Buffers", 0) / tot, pc(m.get("Buffers", 0)), TEXT),
@@ -2954,7 +2992,7 @@ def view_battery(s, st, cfg, pn):
         pn.batlong_t = now
     t0, p0 = pn.__dict__.setdefault("bat0", (now, pct))
     trend = f"{(pct - p0) / ((now - t0) / 3600):+.1f} %/h" if now - t0 >= 300 else "measuring..."
-    side = [(icon, "status", st_.lower()), ("", "time", eta, AMBER if fast else TEXT), ("", "charge", f"{amt(b['now'])} of {amt(b['full'])}"),
+    side = [(icon, "status", st_.lower(), HL_GOOD if st_ in ("Full", "Charging") or ac else TEXT), ("", "time", eta, AMBER if fast else TEXT), ("", "charge", f"{amt(b['now'])} of {amt(b['full'])}"),
             ("", "trend", trend)]
     if b["cap"] is not None:
         side.append(("", "kernel", f"{b['cap']}% of design charge"))
@@ -3092,7 +3130,7 @@ def view_power(s, st, cfg, pn):
     e["wh"] += raw * (now - e["t"]) / 3600
     e["t"], e["peak"] = now, max(e["peak"], raw)
     run_h = (now - e["t0"]) / 3600
-    side = [(IC["plug"] if ac else IC["unplug"], "source", "AC adapter" if ac else ("battery" if b else "--")),
+    side = [(IC["plug"] if ac else IC["unplug"], "source", "AC adapter" if ac else ("battery" if b else "--"), GREEN if ac else AMBER),
             ("", "battery", f"{sign}{bw:.1f} W {way}" if b else "none"),
             ("", "energy", f"{e['wh']:.2f} Wh in {run_h * 60:.0f} min" if run_h < 1 else f"{e['wh']:.1f} Wh in {run_h:.1f} h"),
             ("", "average", f"{e['wh'] / run_h:.1f} W" if run_h > 0.01 else "measuring..."),
@@ -3282,17 +3320,20 @@ def view_network(s, st, cfg, pn):
     # rates against the rx / tx bitrates, the larger), the rates at a fixed width, the address
     dq = th_hist(pn, "v:q", q) if q is not None else None
     sig = round(sum(list(dq)[-3:]) / len(list(dq)[-3:])) if dq else None
+    sc = warn(sig, 40, 20, low=True) if sig is not None else GREY     # amber under 40 %, red at 20
     down_t, up_t = steady_rate(pn, sd, "nu_down"), steady_rate(pn, su, "nu_up")
     mbps = lambda k: float(w[k].split()[0]) if w and re.match(r"[\d.]+ ", w.get(k, "")) and float(w[k].split()[0]) > 0 else None
     rx_r, tx_r = mbps("rx bitrate"), mbps("tx bitrate")
     use = [v * 8 / (r * 1e6) for v, r in ((sd, rx_r), (su, tx_r)) if r]
     load = f"{round(max(0.0, min(1.0, max(use))) * 100)}% of {rx_r or tx_r:g} Mb/s" if use else "link rate unknown"
     if w and w.get("SSID"):
-        side = [(icon, "wifi", w["SSID"] + (f" · {w['dbm']} dBm" if q is not None else ""))]
+        side = [(icon, "wifi", w["SSID"])]
+        if sig is not None:                              # the signal, now the readout is gone
+            side.append(("", "signal", f"{sig}% · {w['dbm']} dBm", sc))
     else:
         side = [(icon, "wifi", "no wifi", GREY)]
-    side += [("", "load", load), ("", "down", down_t), ("", "up", up_t), ("", "ipv4", ip or "--")]
-    sc = warn(sig, 40, 20, low=True) if sig is not None else GREY     # amber under 40 %, red at 20
+    side += [("", "load", load), ("", "down", down_t, HL_HIST), ("", "up", up_t, HL_GOOD), ("", "ipv4", ip or "--")]
+
     rows = [{"big": digits(sig, 3) if sig is not None else "_--", "unit": "%", "c": sc, "side": side,
              "row": [("signal", (sig or 0) / 100, f"{sig}%" if sig is not None else "no wifi", sc, sc),
                      ("down", None, f"{down_t.strip()}   up {up_t.strip()}")]}]   # the fallback keeps the rates
